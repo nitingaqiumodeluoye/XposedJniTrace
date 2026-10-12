@@ -1,0 +1,2 @@
+# 模块 native 库文件名(必须存在于 APK 的 lib/arm64-v8a/ 下,且不能带路径)
+libFunJni.so

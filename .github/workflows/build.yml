@@ -75,9 +75,10 @@ jobs:
           echo "APK: $APK"
           ENTRIES="$(unzip -l "$APK")"
           echo "$ENTRIES"
-          # Vector daemon 靠这两个文件发现模块入口(LEGACY 策略)
-          echo "$ENTRIES" | grep -q "assets/xposed_init" || { echo "!! 缺少 assets/xposed_init"; exit 1; }
-          echo "$ENTRIES" | grep -q "assets/native_init"  || { echo "!! 缺少 assets/native_init"; exit 1; }
+          # Vector daemon 靠这些文件发现模块入口(MODERN 策略: targetApiVersion >= 101)
+          echo "$ENTRIES" | grep -q "META-INF/xposed/module.prop"    || { echo "!! 缺少 module.prop"; exit 1; }
+          echo "$ENTRIES" | grep -q "META-INF/xposed/java_init.list" || { echo "!! 缺少 java_init.list"; exit 1; }
+          echo "$ENTRIES" | grep -q "META-INF/xposed/native_init.list" || { echo "!! 缺少 native_init.list"; exit 1; }
           # soLoader 只接受 lib/arm64-v8a/<纯文件名>.so
           echo "$ENTRIES" | grep -q "lib/arm64-v8a/libFunJni.so" || { echo "!! 缺少模块 so"; exit 1; }
           echo "$ENTRIES" | grep -q "lib/arm64-v8a/libsecure.so" || { echo "!! 缺少 libsecure.so"; exit 1; }

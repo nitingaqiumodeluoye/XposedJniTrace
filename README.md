@@ -13,7 +13,7 @@
 | | 老版本 | 本仓库 |
 | --- | --- | --- |
 | 框架 | 任意 Xposed(de.robv 包名) | **Vector**(`de.wwb.android.wbosed`) |
-| 模块 so 装载 | 自己解压 APK + 反射 `Runtime.nativeLoad` | Vector soLoader(`native_init`) |
+| 模块 so 装载 | 自己解压 APK + 反射 `Runtime.nativeLoad` | Vector soLoader(`META-INF/xposed/native_init.list` + `native_init`) |
 | native 入口 | `JNI_OnLoad` | 导出 `native_init(const NativeAPIEntries*)` |
 | inline hook | Dobby + sandhook 三级降级 | Vector 下发的 **wxshadow**(`entries->hookFunc`) |
 | ABI | armeabi-v7a + arm64-v8a | **arm64-v8a**(Vector soLoader 当前只支持它) |
@@ -22,18 +22,35 @@
 
 ---
 
+## 装载路径(为什么是 MODERN + targetApiVersion=101)
+
+Vector 有两条完全不同的模块装载路径：
+
+| | LEGACY | MODERN |
+| --- | --- | --- |
+| 判定 | 无 `targetApiVersion` 且 APK 里有 `assets/xposed_init` | `module.prop` 的 `targetApiVersion >= 101` |
+| 入口元数据 | `assets/xposed_init` + `assets/native_init` | `META-INF/xposed/java_init.list` + `native_init.list` |
+| so 怎么装载 | 框架把 `apk!/lib/<abi>` 塞进 librarySearchPath，**要模块自己 `System.loadLibrary`** | daemon sealed SharedMemory → `NativeAPI.loadNativeLibraries()` → `ElfLoader::LoadLibraryFd()`(匿名装载) |
+| native 入口 | `System.loadLibrary` 后由 do_dlopen 监视器的 **DIAG** 分支调 `native_init` | soLoader 装载后经载体 trampoline 调 `native_init` |
+| 痕迹 | 目标进程 maps 里留下 `base.apk` 外来代码容器映射 | 无 |
+
+本模块走 **MODERN**：`targetApiVersion=101`。
+选 101 而不是 102 是因为 `VectorModuleManager` 里
+`blockLegacyApi = targetApiVersion >= 102` —— 101 既能用 soLoader 装载，
+又还能用 legacy API(`XSharedPreferences` 等)，改动最小。
+
+入口类是 `LHook extends WbModule`，在 `onModuleLoaded` 里读配置、装 hook。
+MODERN 路线拿不到 `LoadPackageParam`，所以目标包名从进程名推导
+(`com.foo:remote` → `com.foo`)。
+
 ## 安装与使用
 
 1. **安装本 APK**(release,非 debuggable,由 `jnitraceKey.jks` 签名)。
 2. 在 **Vector 管理器**里勾选本模块为启用模块。
-3. **把本模块自己(`com.zhenxi.jnitrace`)也加入作用域** —— 这是必须的：
-   模块 App 保存的配置写在 `getSharedPreferences("config")`，而框架只有在
-   「被加载的包本身是模块」时才会把它的 `getPreferencesDir()` 重定向到
-   `/data/adb/…/prefs/<模块包名>/`(World-Readable)，目标进程的 `XSharedPreferences`
-   才能读到这份配置(Vector 的 `LegacyDelegateImpl.hookNewXSP` +
-   `XSharedPreferences` 的 newModule 分支)。否则只能退回 root 写文件那条路。
-4. 打开模块 App → 选择目标 App → 填过滤关键字 → 勾选功能 → 确定。
-5. **重启目标 App**(模块在进程启动早期注入，配置需要一次冷启动)。
+3. 打开模块 App → 选择目标 App → 填过滤关键字 → 勾选功能 → 确定。
+   配置会由 App 用 root 写到 `/data/data/<目标包>/FunJniConfig`
+   (同时写一份到模块自己的 `XSharedPreferences`，目标进程优先读它、失败再读文件)。
+4. 把目标 App 加进本模块的作用域，**重启目标 App**(模块在进程启动早期注入，配置需要一次冷启动)。
 
 ### 配置项
 
@@ -62,8 +79,9 @@
 CMake `3.22.1`、compileSdk 35 / buildTools 35.0.0、C++20、arm64-v8a。
 
 CI：push 触发 `.github/workflows/build.yml`，打 `v*` tag 触发 `release.yml`。
-CI 会额外校验：`assets/xposed_init` / `assets/native_init` / `lib/arm64-v8a/libFunJni.so` /
-so 导出 `native_init` / 非 debuggable / **签名 MD5 与 `sec/checkSign.cpp` 期望一致**
+CI 会额外校验：`META-INF/xposed/{module.prop,java_init.list,native_init.list}` /
+`lib/arm64-v8a/libFunJni.so` / so 导出 `native_init` / 非 debuggable /
+**签名 MD5 与 `sec/checkSign.cpp` 期望一致**
 (不校验就会出来一个自己 `System.exit(9)` 的 APK)。
 
 ### Vector API jar

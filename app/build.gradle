@@ -42,6 +42,11 @@ android {
     }
 
     packaging {
+        // META-INF/xposed/* 必须原样进包,否则 daemon 发现不到模块入口
+        // (MODERN 策略读 java_init.list / native_init.list / module.prop)
+        resources {
+            merges += "META-INF/xposed/*"
+        }
         // 模块 so 保持不压缩(和 Vector 示例一致)
         jniLibs {
             useLegacyPackaging = false
@@ -86,7 +91,8 @@ android {
             shrinkResources false
             signingConfig signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            buildConfigField "boolean", "is_printf_log", "false"
+            // 这是个调试工具,release 也保留 logcat 输出(只影响日志,不影响 debuggable 标志)
+            buildConfigField "boolean", "is_printf_log", "true"
             buildConfigField "String", "project_name", "\"FunJni\""
         }
     }

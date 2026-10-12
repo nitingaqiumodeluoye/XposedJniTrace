@@ -28,15 +28,24 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 
-import de.wwb.android.wbosed.IXposedHookZygoteInit;
-import de.wwb.android.wbosed.WbLoadPackage;
-import de.wwb.android.wbosed.XC_MethodHook;
 import de.wwb.android.wbosed.XSharedPreferences;
-import de.wwb.android.wbosed.XposedBridge;
-import de.wwb.android.wbosed.callbacks.XC_LoadPackage;
+import de.wwb.android.wbosed.api.WbModule;
+import de.wwb.android.wbosed.api.WbModuleInterface;
 
 
-public class LHook implements WbLoadPackage, IXposedHookZygoteInit {
+/**
+ * Vector 模块入口。
+ *
+ * 走 MODERN 路线(module.prop 里 targetApiVersion=101):
+ *   - 101 < 102,所以 legacy API(XSharedPreferences 等)仍然可用;
+ *   - 但加载走 MODERN:daemon 读 META-INF/xposed/java_init.list + native_init.list,
+ *     模块 so 由 Vector soLoader 匿名装载并把 NativeAPIEntries 交给 native_init,
+ *     不会像 legacy 路径那样要求模块自己 System.loadLibrary(APK zip entry 直载 linker)。
+ *
+ * 101 与 102 的差别只在 legacy API 是否被封禁
+ * (VectorModuleManager: blockLegacyApi = targetApiVersion >= 102)。
+ */
+public class LHook extends WbModule {
 
     private static final String DEF_VALUE = "DEF";
 
@@ -132,10 +141,23 @@ public class LHook implements WbLoadPackage, IXposedHookZygoteInit {
         }
     }
 
+    /**
+     * 从进程名推导包名(子进程形如 com.foo:remote)。
+     * MODERN 路线拿不到 LoadPackageParam,但配置里的目标包名和被注入进程是一致的,
+     * 而日志/序列化文件都写在目标包自己的 data 目录下,所以按进程名推导即可。
+     */
+    private static String packageNameOf(String processName) {
+        if (processName == null) {
+            return null;
+        }
+        int idx = processName.indexOf(':');
+        return idx > 0 ? processName.substring(0, idx) : processName;
+    }
+
     @Override
-    @SuppressWarnings("all")
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam loadPackageParam) throws Throwable {
-        mProcessName = loadPackageParam.processName;
+    public void onModuleLoaded(WbModuleInterface.ModuleLoadedParam param) {
+        mProcessName = param.getProcessName();
+        final String processPackageName = packageNameOf(mProcessName);
 
         try {
             String configJson = DEF_VALUE;
@@ -156,7 +178,7 @@ public class LHook implements WbLoadPackage, IXposedHookZygoteInit {
                 try {
                     CLog.i("find config package name == null ,start read config  ");
                     File file = new File("/data/data/" +
-                            loadPackageParam.packageName + "/" + BuildConfig.project_name + "Config");
+                            processPackageName + "/" + BuildConfig.project_name + "Config");
                     if (!file.exists()) {
                         CLog.e("not find root config file " + file.getPath());
                         return;
@@ -173,19 +195,20 @@ public class LHook implements WbLoadPackage, IXposedHookZygoteInit {
                 initConfigData(configInfo);
             }
 
-            CLog.i("load app -> " +
-                    loadPackageParam.packageName + " process name ->[" + mProcessName + "]" +
-                    "  tag package name -> " + mTagPackageName);
+            CLog.i("load process -> " + mProcessName
+                    + " (package " + processPackageName + ")"
+                    + "  tag package name -> " + mTagPackageName);
 
-            if (isMatch(loadPackageParam.packageName)) {
-                CLog.e("find tag app ->  " + loadPackageParam.packageName);
-                CLog.i("[" + mTagPackageName + "]init config success ! isSerialization -> "
-                        + isSerialization + "  into so path -> " + mIntoSoPath + " is hook all -> " + isListenAll);
+            if (isMatch(processPackageName)) {
+                CLog.e("find tag app ->  " + processPackageName);
+                CLog.i("[" + mTagPackageName + "] init config success ! isSerialization -> "
+                        + isSerialization + "  is hook all -> " + isListenAll
+                        + "  functions -> " + mFunctionList);
                 startInit();
             }
         } catch (Throwable e) {
             e.printStackTrace();
-            CLog.e("handleLoadPackage  Exception  " + e.getMessage());
+            CLog.e("onModuleLoaded Exception  " + e.getMessage());
         }
     }
 
@@ -209,26 +232,11 @@ public class LHook implements WbLoadPackage, IXposedHookZygoteInit {
     @SuppressWarnings("all")
     private void startInit() {
         if (isSerialization) {
-            Context context = ContextUtils.getContext();
-            if (context != null) {
-                startSerialization(context);
-                return;
-            }
-            try {
-                XposedBridge.hookAllMethods(
-                        Class.forName("android.app.ContextImpl"),
-                        "createAppContext",
-                        new XC_MethodHook() {
-                            @Override
-                            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                                super.afterHookedMethod(param);
-                                CLog.e("hook createAppContext success !");
-                                startSerialization((Context) param.getResult());
-                            }
-                        });
-            } catch (Throwable e) {
-                CLog.e("hook createAppContext error  " + e.getMessage());
-            }
+            // 内存漫游只需要一个能取到包名/文件路径的 Context。
+            // 原来这里 hook android.app.ContextImpl#createAppContext 来拿 Context ——
+            // MODERN 路线里模块拿到的是 WbModule 上下文,不需要也不该再去 hook ContextImpl;
+            // ContextUtils 自己会用 VMDebug.getInstancesOfClasses 找 Application 实例。
+            startSerialization(ContextUtils.getContext());
         } else {
             initFunJni();
         }
@@ -324,12 +332,6 @@ public class LHook implements WbLoadPackage, IXposedHookZygoteInit {
         } catch (Throwable e) {
             CLog.e("start hook jni error " + e);
         }
-    }
-
-
-    @Override
-    public void initZygote(StartupParam startupParam) {
-
     }
 
 

@@ -67,8 +67,9 @@ jobs:
           APK="$(find app/build/outputs/apk/release -name '*.apk' | head -1)"
           VERSION="${GITHUB_REF_NAME:-manual}"
           ENTRIES="$(unzip -l "$APK")"
-          echo "$ENTRIES" | grep -q "assets/xposed_init" || { echo "!! 缺少 assets/xposed_init"; exit 1; }
-          echo "$ENTRIES" | grep -q "assets/native_init"  || { echo "!! 缺少 assets/native_init"; exit 1; }
+          echo "$ENTRIES" | grep -q "META-INF/xposed/module.prop"    || { echo "!! 缺少 module.prop"; exit 1; }
+          echo "$ENTRIES" | grep -q "META-INF/xposed/java_init.list" || { echo "!! 缺少 java_init.list"; exit 1; }
+          echo "$ENTRIES" | grep -q "META-INF/xposed/native_init.list" || { echo "!! 缺少 native_init.list"; exit 1; }
           echo "$ENTRIES" | grep -q "lib/arm64-v8a/libFunJni.so" || { echo "!! 缺少模块 so"; exit 1; }
           CERT="$("${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS}/apksigner" verify --print-certs "$APK" \
                   | grep -i 'certificate MD5 digest' | head -1 | sed 's/.*digest: //' | tr -d '\r')"
