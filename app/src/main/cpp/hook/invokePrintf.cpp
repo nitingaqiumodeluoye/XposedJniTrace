@@ -39,7 +39,8 @@ static void writeInvokeLog(const std::string &msg) {
     }
     std::ofstream *os = invokeOs.load();
     if (os != nullptr && isSave.load()) {
-        TraceLog::writeLine(os, msg);
+        // TraceLog 在 ZhenxiRunTime 命名空间下,而这里是全局作用域,需要写全名
+        ZhenxiRunTime::TraceLog::writeLine(os, msg);
     }
 }
 

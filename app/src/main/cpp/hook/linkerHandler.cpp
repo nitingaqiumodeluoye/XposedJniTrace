@@ -62,7 +62,7 @@ namespace ZhenxiRunTime::linkerHandler {
         char buffer[PATH_MAX] = {};
         // size 是 size_t,原来用 %lu 在部分 ABI 上是未定义行为;原来也没换行,多条会连成一行
         snprintf(buffer, sizeof(buffer),
-                 "linker load %s  start-> 0x%zx  end-> 0x%zx  size -> %zu  handle -> %p\n"
+                 "linker load %s  start-> 0x%zx  end-> 0x%zx  size -> %zu  handle -> %p\n",
                  filename, mapInfo.start, mapInfo.end,
                  (mapInfo.end - mapInfo.start), ret);
         std::ofstream *os = hookStrHandlerOs.load();
