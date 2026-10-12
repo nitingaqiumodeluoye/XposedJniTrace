@@ -3,7 +3,7 @@ package com.zhenxi.jnitrace.utils;
 import android.content.Context;
 import android.content.SharedPreferences;
 
-import static android.content.Context.MODE_WORLD_READABLE;
+import static android.content.Context.MODE_PRIVATE;
 
 public class SpUtil {
 	private static SharedPreferences sp;
@@ -16,7 +16,7 @@ public class SpUtil {
 	public static void putBoolean(Context ctx,String key,boolean value){
 		//(存储节点文件名称,读写方式)
 		if(sp == null){
-			sp = ctx.getSharedPreferences("config", MODE_WORLD_READABLE);
+			sp = ctx.getSharedPreferences("config", MODE_PRIVATE);
 		}
 		sp.edit().putBoolean(key, value).commit();
 	}
@@ -30,7 +30,7 @@ public class SpUtil {
 	public static boolean getBoolean(Context ctx,String key,boolean defValue){
 		//(存储节点文件名称,读写方式)
 		if(sp == null){
-			sp = ctx.getSharedPreferences("config", MODE_WORLD_READABLE);
+			sp = ctx.getSharedPreferences("config", MODE_PRIVATE);
 		}
 		return sp.getBoolean(key, defValue);
 	}
@@ -44,7 +44,7 @@ public class SpUtil {
 	public static void putString(Context ctx,String key,String value){
 		//(存储节点文件名称,读写方式)
 		if(sp == null){
-			sp = ctx.getSharedPreferences("config", MODE_WORLD_READABLE);
+			sp = ctx.getSharedPreferences("config", MODE_PRIVATE);
 		}
 		sp.edit().putString(key, value).commit();
 	}
@@ -58,7 +58,7 @@ public class SpUtil {
 	public static String getString(Context ctx,String key,String defValue){
 		//(存储节点文件名称,读写方式)
 		if(sp == null){
-			sp = ctx.getSharedPreferences("config", MODE_WORLD_READABLE);
+			sp = ctx.getSharedPreferences("config", MODE_PRIVATE);
 		}
 		return sp.getString(key, defValue);
 	}
@@ -73,7 +73,7 @@ public class SpUtil {
 	public static void putInt(Context ctx,String key,int value){
 		//(存储节点文件名称,读写方式)
 		if(sp == null){
-			sp = ctx.getSharedPreferences("config", MODE_WORLD_READABLE);
+			sp = ctx.getSharedPreferences("config", MODE_PRIVATE);
 		}
 		sp.edit().putInt(key, value).commit();
 	}
@@ -87,7 +87,7 @@ public class SpUtil {
 	public static int getInt(Context ctx,String key,int defValue){
 		//(存储节点文件名称,读写方式)
 		if(sp == null){
-			sp = ctx.getSharedPreferences("config", MODE_WORLD_READABLE);
+			sp = ctx.getSharedPreferences("config", MODE_PRIVATE);
 		}
 		return sp.getInt(key, defValue);
 	}
@@ -101,7 +101,7 @@ public class SpUtil {
 	 */
 	public static void remove(Context ctx, String key) {
 		if(sp == null){
-			sp = ctx.getSharedPreferences("config", MODE_WORLD_READABLE);
+			sp = ctx.getSharedPreferences("config", MODE_PRIVATE);
 		}
 		sp.edit().remove(key).commit();
 	}

@@ -20,32 +20,23 @@ import com.zhenxi.jnitrace.utils.ChooseUtils;
 import com.zhenxi.jnitrace.utils.ContextUtils;
 import com.zhenxi.jnitrace.utils.FileUtils;
 import com.zhenxi.jnitrace.utils.GsonUtils;
-import com.zhenxi.jnitrace.utils.IntoMySoUtils;
 import com.zhenxi.jnitrace.utils.ThreadUtils;
 
 import org.json.JSONObject;
-import org.lsposed.hiddenapibypass.HiddenApiBypass;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 
-import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.IXposedHookZygoteInit;
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XSharedPreferences;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import de.wwb.android.wbosed.IXposedHookZygoteInit;
+import de.wwb.android.wbosed.WbLoadPackage;
+import de.wwb.android.wbosed.XC_MethodHook;
+import de.wwb.android.wbosed.XSharedPreferences;
+import de.wwb.android.wbosed.XposedBridge;
+import de.wwb.android.wbosed.callbacks.XC_LoadPackage;
 
 
-public class LHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
-
-    private static void passApiCheck() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
-            return;
-        }
-        HiddenApiBypass.addHiddenApiExemptions("");
-    }
+public class LHook implements WbLoadPackage, IXposedHookZygoteInit {
 
     private static final String DEF_VALUE = "DEF";
 
@@ -205,22 +196,24 @@ public class LHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
                 //&& (System.currentTimeMillis() - mSaveTime) < (1000 * 60 * 10);
     }
 
-    private void intoMySo(Context context) {
-        try {
-            IntoMySoUtils.initMySoForName(context,
-                    "lib" + BuildConfig.project_name + ".so", LHook.class.getClassLoader(), mIntoSoPath);
-            CLog.i("init my so finish");
-        } catch (Throwable e) {
-            CLog.e("initSo error " + e.getMessage());
-            e.printStackTrace();
-        }
-    }
-
+    /**
+     * 初始化。
+     *
+     * 变更点(相对老的 Xposed 版本):
+     *   1. 不再需要 passApiCheck() —— Vector 会对模块 ClassLoader 做 hidden api 豁免
+     *      (VectorModuleManager 里的 HookBridge.exemptModuleClassLoaderHiddenApi);
+     *   2. 不再需要 intoMySo() 解压 + 反射注入 —— 模块 so 由 Vector 的 soLoader 装载,
+     *      native 入口是 native_init(见 app/src/main/cpp/main.cpp);
+     *   3. 只有内存漫游还需要 Context(取包名/路径),所以 Context 的获取只给这一条路径用。
+     */
     @SuppressWarnings("all")
     private void startInit() {
-        passApiCheck();
-        Context context = ContextUtils.getContext();
-        if (context == null) {
+        if (isSerialization) {
+            Context context = ContextUtils.getContext();
+            if (context != null) {
+                startSerialization(context);
+                return;
+            }
             try {
                 XposedBridge.hookAllMethods(
                         Class.forName("android.app.ContextImpl"),
@@ -230,15 +223,14 @@ public class LHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
                             protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                                 super.afterHookedMethod(param);
                                 CLog.e("hook createAppContext success !");
-                                Context ret = (Context) param.getResult();
-                                initFunJni(ret);
+                                startSerialization((Context) param.getResult());
                             }
                         });
             } catch (Throwable e) {
                 CLog.e("hook createAppContext error  " + e.getMessage());
             }
         } else {
-            initFunJni(context);
+            initFunJni();
         }
     }
 
@@ -305,44 +297,33 @@ public class LHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
     }
 
     @SuppressWarnings("All")
-    private void initFunJni(Context context) {
+    private void initFunJni() {
         if (isInit) {
             return;
         }
-        if (context == null) {
+        if (mFunctionList == null || mFunctionList.isEmpty()) {
+            CLog.e("function list size == 0 !!!!!!!!!!!!!!!!! " + mProcessName);
+            CLog.e("function list size == 0 !!!!!!!!!!!!!!!!! " + mTagPackageName);
+            CLog.e("function list size == 0 !!!!!!!!!!!!!!!!! ");
             return;
         }
-        CLog.i(">>>>>>>> start init funJni , " +
-                "get context sucess [" + context.getPackageName() + "]");
-        if (isSerialization) {
-            //处理内存序列化
-            CLog.e(">>>>>>>>>>>>>>>>> start mem serialization !!!!!");
-            startSerialization(context);
-        } else {
-            try {
-                //处理JNI监听
-                intoMySo(context);
-                File file = new File("/data/data/"
-                        + mTagPackageName + "/(" + mProcessName + ")"
-                        + (isListenAll ? "[ALL]" : mFilterList.toString()) + ".txt");
-                if (file.exists()) {
-                    file.delete();
-                }
-                file.createNewFile();
-                CLog.i(">>>>>>>>>>> start hook jni " + file.getPath());
-                if(mFunctionList!=null&&mFunctionList.size() ==0){
-                    CLog.e("function list size == 0 !!!!!!!!!!!!!!!!! "+mProcessName);
-                    CLog.e("function list size == 0 !!!!!!!!!!!!!!!!! "+mTagPackageName);
-                    CLog.e("function list size == 0 !!!!!!!!!!!!!!!!! ");
-                    return;
-                }
-                //start hook native
-                startHookJni(isListenAll, mFilterList, mFunctionList, file.getPath());
-            } catch (Throwable e) {
-                CLog.e("into&hook jni error " + e);
-            }
-        }
         isInit = true;
+        CLog.i(">>>>>>>> start init funJni , process [" + mProcessName + "]");
+        try {
+            // 输出文件放在目标 app 自己的私有目录下(注入进程就是目标进程,uid 相同,可写)
+            File file = new File("/data/data/"
+                    + mTagPackageName + "/(" + mProcessName + ")"
+                    + (isListenAll ? "[ALL]" : mFilterList.toString()) + ".txt");
+            if (file.exists()) {
+                file.delete();
+            }
+            file.createNewFile();
+            CLog.i(">>>>>>>>>>> start hook jni " + file.getPath());
+            //start hook native
+            startHookJni(isListenAll, mFilterList, mFunctionList, file.getPath());
+        } catch (Throwable e) {
+            CLog.e("start hook jni error " + e);
+        }
     }
 
 

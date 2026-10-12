@@ -37,6 +37,9 @@ __attribute__((always_inline))
 static inline
 size_t my_strlen(const char *s)
 {
+    if(s == nullptr){
+        return 0;
+    }
     size_t len = 0;
     while(*s++) len++;
     return len;
@@ -61,6 +64,9 @@ __attribute__((always_inline))
 static inline char *
 my_strstr(const char *s, const char *find)
 {
+    if(find == nullptr||s == nullptr){
+        return nullptr;
+    }
     char c, sc;
     size_t len;
 
@@ -117,46 +123,46 @@ static inline int my_atoi(const char *s)
     return neg ? n : -n;
 }
 
-__attribute__((always_inline))
-static inline int  my_openat(int __dir_fd, const void* __path, int __flags, int __mode ){
-    return (int)raw_syscall(__NR_openat, __dir_fd, (long)__path, __flags, __mode);
-}
-
-__attribute__((always_inline))
-static inline int  my_open(const void* __path, int __flags, int __mode ){
-    return (int)raw_syscall(__NR_openat, AT_FDCWD, (long)__path, __flags, __mode);
-}
-
-__attribute__((always_inline))
-static inline ssize_t my_read(int __fd, void* __buf, size_t __count){
-    return raw_syscall(__NR_read, __fd, (long)__buf, (long)__count);
-}
-
-__attribute__((always_inline))
-static inline off_t my_lseek(int __fd, off_t __offset, int __whence){
-    return raw_syscall(__NR_lseek, __fd, __offset, __whence);
-}
-
-__attribute__((always_inline))
-static inline int my_close(int __fd){
-    return (int)raw_syscall(__NR_close, __fd);
-}
-
-__attribute__((always_inline))
-static inline int my_nanosleep(const struct timespec* __request, struct timespec* __remainder){
-    return (int)raw_syscall(__NR_nanosleep, (long)__request, (long)__remainder);
-}
-
-__attribute__((always_inline))
-static inline ssize_t my_readlinkat(int __dir_fd, const char* __path, char* __buf, size_t __buf_size){
-    return raw_syscall(__NR_readlinkat, __dir_fd, (long)__path, (long)__buf,(long)__buf_size);
-}
-
-//Not Used
-__attribute__((always_inline))
-static inline int my_tgkill(int __tgid, int __tid, int __signal){
-    return (int)raw_syscall(__NR_tgkill, __tgid, __tid, __signal);
-}
+//__attribute__((always_inline))
+//static inline int  my_openat(int __dir_fd, const void* __path, int __flags, int __mode ){
+//    return (int)raw_syscall(__NR_openat, __dir_fd, (long)__path, __flags, __mode);
+//}
+//
+//__attribute__((always_inline))
+//static inline int  my_open(const void* __path, int __flags, int __mode ){
+//    return (int)raw_syscall(__NR_openat, AT_FDCWD, (long)__path, __flags, __mode);
+//}
+//
+//__attribute__((always_inline))
+//static inline ssize_t my_read(int __fd, void* __buf, size_t __count){
+//    return raw_syscall(__NR_read, __fd, (long)__buf, (long)__count);
+//}
+//
+//__attribute__((always_inline))
+//static inline off_t my_lseek(int __fd, off_t __offset, int __whence){
+//    return raw_syscall(__NR_lseek, __fd, __offset, __whence);
+//}
+//
+//__attribute__((always_inline))
+//static inline int my_close(int __fd){
+//    return (int)raw_syscall(__NR_close, __fd);
+//}
+//
+//__attribute__((always_inline))
+//static inline int my_nanosleep(const struct timespec* __request, struct timespec* __remainder){
+//    return (int)raw_syscall(__NR_nanosleep, (long)__request, (long)__remainder);
+//}
+//
+//__attribute__((always_inline))
+//static inline ssize_t my_readlinkat(int __dir_fd, const char* __path, char* __buf, size_t __buf_size){
+//    return raw_syscall(__NR_readlinkat, __dir_fd, (long)__path, (long)__buf,(long)__buf_size);
+//}
+//
+////Not Used
+//__attribute__((always_inline))
+//static inline int my_tgkill(int __tgid, int __tid, int __signal){
+//    return (int)raw_syscall(__NR_tgkill, __tgid, __tid, __signal);
+//}
 
 //__attribute__((always_inline))
 //static inline void* my_mmap(void* __addr, size_t __size, int __prot, int __flags, int __fd, off_t __offset){
@@ -164,9 +170,43 @@ static inline int my_tgkill(int __tgid, int __tid, int __signal){
 //}
 
 //Not Used
+//__attribute__((always_inline))
+//static inline void my_exit(int __status){
+//    raw_syscall(__NR_exit, __status);
+//}
 __attribute__((always_inline))
-static inline void my_exit(int __status){
-    raw_syscall(__NR_exit, __status);
+static inline char* int_to_str(int num) {
+    bool is_negative = false;
+    if (num < 0) {
+        is_negative = true;
+        num = -num;
+    }
+
+    int len = 0;
+    int temp = num;
+    do {
+        temp /= 10;
+        len++;
+    } while (temp > 0);
+
+    if (is_negative) {
+        len++;
+    }
+
+    char* str = (char*)malloc(len + 1);
+    str[len] = '\0';
+
+    int i = len - 1;
+    do {
+        str[i--] = (num % 10) + '0';
+        num /= 10;
+    } while (num > 0);
+
+    if (is_negative) {
+        str[0] = '-';
+    }
+
+    return str;
 }
 
 __attribute__((always_inline))
@@ -196,11 +236,70 @@ static inline char *my_stpcpy(char*  d,const char * s)
 
 __attribute__((always_inline)) static inline
 char *my_strcat(char * dest, const char * src){
-    my_stpcpy(dest + strlen(dest), src);
+    my_stpcpy(dest + my_strlen(dest), src);
+    return dest;
+}
+__attribute__((always_inline)) static inline
+void *my_memcpy(void *dest, const void *src, size_t n) {
+    unsigned char *d = static_cast<unsigned char *>(dest);
+    const unsigned char *s = static_cast<const unsigned char *>(src);
+
+    for (size_t i = 0; i < n; ++i) {
+        d[i] = s[i];
+    }
+
     return dest;
 }
 
+// ---------------------------------------------------------------------------
+// 以下为基于 raw_syscall 的直接系统调用封装(sec/cert.cpp 依赖 my_openat)。
+// 不经过 libc,避免被 io 重定向/plthook 影响。
+// ---------------------------------------------------------------------------
+__attribute__((always_inline))
+static inline int my_openat(int __dir_fd, const void *__path, int __flags, int __mode) {
+    return (int) raw_syscall(__NR_openat, __dir_fd, (long) __path, __flags, __mode);
+}
 
+__attribute__((always_inline))
+static inline int my_open(const void *__path, int __flags, int __mode) {
+    return (int) raw_syscall(__NR_openat, AT_FDCWD, (long) __path, __flags, __mode);
+}
 
+__attribute__((always_inline))
+static inline ssize_t my_read(int __fd, void *__buf, size_t __count) {
+    return raw_syscall(__NR_read, __fd, (long) __buf, (long) __count);
+}
+
+__attribute__((always_inline))
+static inline off_t my_lseek(int __fd, off_t __offset, int __whence) {
+    return raw_syscall(__NR_lseek, __fd, __offset, __whence);
+}
+
+__attribute__((always_inline))
+static inline int my_close(int __fd) {
+    return (int) raw_syscall(__NR_close, __fd);
+}
+
+__attribute__((always_inline))
+static inline int my_nanosleep(const struct timespec *__request, struct timespec *__remainder) {
+    return (int) raw_syscall(__NR_nanosleep, (long) __request, (long) __remainder);
+}
+
+__attribute__((always_inline))
+static inline ssize_t my_readlinkat(int __dir_fd, const char *__path, char *__buf, size_t __buf_size) {
+    return raw_syscall(__NR_readlinkat, __dir_fd, (long) __path, (long) __buf, (long) __buf_size);
+}
+
+//Not Used
+__attribute__((always_inline))
+static inline int my_tgkill(int __tgid, int __tid, int __signal) {
+    return (int) raw_syscall(__NR_tgkill, __tgid, __tid, __signal);
+}
+
+//Not Used
+__attribute__((always_inline))
+static inline void my_exit(int __status) {
+    raw_syscall(__NR_exit, __status);
+}
 
 #endif //DETECTFRIDA_MYLIBC_H

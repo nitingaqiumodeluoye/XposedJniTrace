@@ -1,12 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest
     xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools"
-    package="com.zhenxi.jnitrace">
-
-
-
-
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- 在SDCard中创建与删除文件权限 -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
@@ -21,7 +16,6 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.READ_LOGS"/>
-
 
 
     <application
@@ -40,9 +34,21 @@
         <meta-data
             android:name="xposeddescription"
             android:value="珍惜--FunJni" />
+        <!--
+            xposedminversion > 92(或下面显式声明 xposedsharedprefs)会让框架:
+              1) 把模块自己进程的 ContextImpl.getPreferencesDir() 重定向到
+                 /data/adb/vector(或 lspd)/prefs/<模块包名>/,这样模块 App 写的
+                 getSharedPreferences("config") 会落到"目标进程也能读"的目录;
+              2) 让目标进程里的 XSharedPreferences 从该目录读配置,而不是去读
+                 /data/data/<模块>/shared_prefs/(目标进程没有权限读)。
+            没有这两条,配置就得靠 root 往目标 data 目录里 mv 一份老办法。
+        -->
         <meta-data
             android:name="xposedminversion"
-            android:value="54" />
+            android:value="93" />
+        <meta-data
+            android:name="xposedsharedprefs"
+            android:value="true" />
 
 
 

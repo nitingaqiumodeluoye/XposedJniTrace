@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  NDK_VERSION: 27.3.13750724
+  CMAKE_VERSION: 3.22.1
+  COMPILE_SDK: 35
+  BUILD_TOOLS: 35.0.0
+  EXPECTED_CERT_MD5_OF_MD5: 43d7c3de4793b2b46c2977863f41e122
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache NDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.NDK_VERSION }}
+          key: ndk-${{ env.NDK_VERSION }}
+
+      - name: Install SDK components
+        run: |
+          SDKMANAGER="$(find "${ANDROID_SDK_ROOT}/cmdline-tools" -name sdkmanager -type f | sort | tail -n 1)"
+          yes | "${SDKMANAGER}" --sdk_root="${ANDROID_SDK_ROOT}" --install \
+            "platforms;android-${COMPILE_SDK}" \
+            "build-tools;${BUILD_TOOLS}" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build release APK
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Verify and package
+        run: |
+          set -e
+          APK="$(find app/build/outputs/apk/release -name '*.apk' | head -1)"
+          VERSION="${GITHUB_REF_NAME:-manual}"
+          ENTRIES="$(unzip -l "$APK")"
+          echo "$ENTRIES" | grep -q "assets/xposed_init" || { echo "!! 缺少 assets/xposed_init"; exit 1; }
+          echo "$ENTRIES" | grep -q "assets/native_init"  || { echo "!! 缺少 assets/native_init"; exit 1; }
+          echo "$ENTRIES" | grep -q "lib/arm64-v8a/libFunJni.so" || { echo "!! 缺少模块 so"; exit 1; }
+          CERT="$("${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS}/apksigner" verify --print-certs "$APK" \
+                  | grep -i 'certificate MD5 digest' | head -1 | sed 's/.*digest: //' | tr -d '\r')"
+          GOT="$(python3 -c "import hashlib,sys; print(hashlib.md5(sys.argv[1].encode()).hexdigest())" "$CERT")"
+          [ "$GOT" = "${EXPECTED_CERT_MD5_OF_MD5}" ] || { echo "!! 签名与 checkSign.cpp 期望不符"; exit 1; }
+
+          mkdir -p release/so
+          cp "$APK" "release/FunJni-${VERSION}.apk"
+          unzip -p "$APK" lib/arm64-v8a/libFunJni.so > release/so/libFunJni-arm64-v8a.so
+          cd release && zip -r "../FunJni-${VERSION}.zip" . && cd ..
+          ls -lh release "FunJni-${VERSION}.zip"
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/FunJni-*.apk
+            FunJni-*.zip
+          generate_release_notes: true
+          body: |
+            ## XposedJniTrace (FunJni) ${{ github.ref_name }}
+
+            适配 Vector 框架(soLoader 基线 / arm64-v8a)的 native JNI trace 模块。
+
+            安装：
+            1. 安装本 APK，在 Vector 管理器中勾选为模块；
+            2. **把本模块自己（`com.zhenxi.jnitrace`）也加入作用域** —— 否则配置
+               （XSharedPreferences，走 `/data/adb/…/prefs/`）无法同步到目标进程；
+            3. 重启目标 App。
+
+            产物：
+            - `FunJni-*.apk`：release（非 debuggable）+ jnitraceKey 签名（反盗版校验要求）
+            - `so/libFunJni-arm64-v8a.so`：单独抽出的模块 so，可用于分析

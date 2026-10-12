@@ -64,22 +64,54 @@ string parse::get_process_name_pid(pid_t pid) {
 }
 
 string parse::jstring2str(JNIEnv *env, jstring jstr) {
-    char *rtn = nullptr;
+    string ret{};
+    if (env == nullptr || jstr == nullptr) {
+        return ret;
+    }
     jclass clsstring = env->FindClass("java/lang/String");
+    if (clsstring == nullptr) {
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        return ret;
+    }
     jstring strencode = env->NewStringUTF("UTF-8");
     jmethodID mid = env->GetMethodID(clsstring, "getBytes", "(Ljava/lang/String;)[B");
-    auto barr = (jbyteArray) env->CallObjectMethod(jstr, mid, strencode);
-    jsize alen = env->GetArrayLength(barr);
-    jbyte *ba = env->GetByteArrayElements(barr, JNI_FALSE);
-    if (alen > 0) {
-        rtn = (char *) malloc(alen + 1);
-        memcpy(rtn, ba, alen);
-        rtn[alen] = 0;
+    if (strencode == nullptr || mid == nullptr) {
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        if (strencode != nullptr) {
+            env->DeleteLocalRef(strencode);
+        }
+        env->DeleteLocalRef(clsstring);
+        return ret;
     }
-    env->ReleaseByteArrayElements(barr, ba, 0);
-    std::string stemp(rtn);
-    free(rtn);
-    return stemp;
+    auto barr = (jbyteArray) env->CallObjectMethod(jstr, mid, strencode);
+    env->DeleteLocalRef(strencode);
+    env->DeleteLocalRef(clsstring);
+    if (barr == nullptr) {
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        return ret;
+    }
+    jsize alen = env->GetArrayLength(barr);
+    if (alen <= 0) {
+        //原实现在这里直接 std::string(rtn) —— rtn 仍是 nullptr,空串会把目标进程搞崩
+        env->DeleteLocalRef(barr);
+        return ret;
+    }
+    jbyte *ba = env->GetByteArrayElements(barr, nullptr);
+    if (ba != nullptr) {
+        ret.assign(reinterpret_cast<char *>(ba), static_cast<size_t>(alen));
+        env->ReleaseByteArrayElements(barr, ba, JNI_ABORT);
+    }
+    env->DeleteLocalRef(barr);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
+    return ret;
 }
 
 map<string, string> parse::jmap2cmap(JNIEnv *env, jobject jmap) {

@@ -1,46 +1,28 @@
-// Top-level build file where you can add configuration options common to all sub-projects/modules.
-
+// Top-level build file
 buildscript {
     repositories {
+        // 官方源优先:CI(海外 runner)访问 aliyun 镜像会 502,把构建打挂
         google()
         mavenCentral()
-        maven {
-            name "aliyunmaven"
-            url "https://maven.aliyun.com/repository/public"
-        }
-        maven {
-            name "aliyunGoogle"
-            url "https://maven.aliyun.com/repository/google"
-        }
+        maven { name "aliyunmaven"; url "https://maven.aliyun.com/repository/public" }
+        maven { name "aliyunGoogle"; url "https://maven.aliyun.com/repository/google" }
+        maven { url 'https://jitpack.io' }
     }
     dependencies {
-        classpath 'com.github.megatronking.stringfog:gradle-plugin:4.0.1'
-        classpath 'com.github.megatronking.stringfog:xor:4.0.1'
+        classpath 'com.android.tools.build:gradle:8.6.1'
     }
 }
-plugins {
-    id 'com.android.application' version '7.4.2' apply false
-    id 'com.android.library' version '7.4.2' apply false
-}
+
 allprojects {
     repositories {
-        maven {
-            name "aliyunmaven"
-            url "https://maven.aliyun.com/repository/public"
-        }
-        maven {
-            name "aliyunGoogle"
-            url "https://maven.aliyun.com/repository/google"
-        }
-        maven { url 'https://www.jitpack.io' }
-
         google()
         mavenCentral()
-
+        maven { name "aliyunmaven"; url "https://maven.aliyun.com/repository/public" }
+        maven { name "aliyunGoogle"; url "https://maven.aliyun.com/repository/google" }
+        maven { url 'https://jitpack.io' }
     }
 }
 
-
-task clean(type: Delete) {
-    delete rootProject.buildDir
+tasks.register('clean', Delete) {
+    delete rootProject.layout.buildDirectory
 }

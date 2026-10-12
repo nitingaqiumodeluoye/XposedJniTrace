@@ -33,7 +33,9 @@ public:
 
 private:
     jstring _j_str;
-    const char *_c_str;
+    // 记录取字符时那个线程的 JNIEnv,析构必须用同一个(env 是线程相关的)
+    JNIEnv *_env = nullptr;
+    const char *_c_str = nullptr;
 };
 
 

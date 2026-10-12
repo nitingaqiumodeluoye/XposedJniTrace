@@ -1,25 +1,15 @@
 pluginManagement {
     repositories {
-        maven {
-            name "aliyunmaven"
-            url "https://maven.aliyun.com/repository/public"
-        }
-        maven {
-            name "aliyunGoogle"
-            url "https://maven.aliyun.com/repository/google"
-        }
+        google()
+        mavenCentral()
         gradlePluginPortal()
-        google()
-        mavenCentral()
+        maven { name "aliyunmaven"; url "https://maven.aliyun.com/repository/public" }
+        maven { name "aliyunGoogle"; url "https://maven.aliyun.com/repository/google" }
     }
 }
-dependencyResolutionManagement {
-    repositories {
-        maven { url "https://jitpack.io" }
-        google()
-        mavenCentral()
-    }
-}
+
+// 仓库统一在根 build.gradle 的 allprojects 里声明(避免和 dependencyResolutionManagement 两处打架)
 rootProject.name = "XposeJniTrace"
+// nativeLib 不再作为 Gradle 模块 —— 它只是一棵被 app 的 CMake 通过
+// add_subdirectory(${HomePath}/nativeLib/src/main/cpp) 引入的源码树
 include ':app'
-include ':nativeLib'

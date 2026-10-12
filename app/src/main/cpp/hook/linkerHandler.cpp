@@ -20,6 +20,7 @@
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <syscall.h>
+#include <atomic>
 #include <climits>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -42,6 +43,7 @@
 
 #include "linkerHandler.h"
 #include "logging.h"
+#include "traceLog.h"
 #include "libpath.h"
 #include "HookUtils.h"
 #include "appUtils.h"
@@ -49,30 +51,34 @@
 
 
 namespace ZhenxiRunTime::linkerHandler {
-    static std::ofstream *hookStrHandlerOs;
-    static bool isSave = false;
-    
-    void onSoLoadedAfter(const char *filename,void *ret){
+    static std::atomic<std::ofstream *> hookStrHandlerOs{nullptr};
+    static std::atomic<bool> isSave{false};
+
+    void onSoLoadedAfter(const char *filename, void *ret) {
+        if (filename == nullptr) {
+            return;
+        }
         auto mapInfo = getSoBaseAddress(filename);
-        char buffer[PATH_MAX];
-        sprintf(buffer, "linker load %s  start-> 0x%zx  end-> 0x%zx  size -> %lu",
-                filename, mapInfo.start, mapInfo.end, (mapInfo.end - mapInfo.start));
-        if (isSave) {
-            if (hookStrHandlerOs != nullptr) {
-                (*hookStrHandlerOs) << buffer;
-            }
+        char buffer[PATH_MAX] = {};
+        // size 是 size_t,原来用 %lu 在部分 ABI 上是未定义行为;原来也没换行,多条会连成一行
+        snprintf(buffer, sizeof(buffer),
+                 "linker load %s  start-> 0x%zx  end-> 0x%zx  size -> %zu  handle -> %p\n"
+                 filename, mapInfo.start, mapInfo.end,
+                 (mapInfo.end - mapInfo.start), ret);
+        std::ofstream *os = hookStrHandlerOs.load();
+        if (isSave.load() && os != nullptr) {
+            // 和 jnitrace / stringHandler 共用同一把文件锁
+            TraceLog::writeLine(os, buffer);
         }
         LOGI("%s ", buffer);
     }
     HOOK_DEF(void *, dlopen_CI, const char *filename, int flag) {
-        char temp[PATH_MAX];
         void *ret = orig_dlopen_CI(filename, flag);
         onSoLoadedAfter(filename, ret);
         return ret;
     }
 
     HOOK_DEF(void*, do_dlopen_CIV, const char *filename, int flag, const void *extinfo) {
-        char temp[PATH_MAX];
         void *ret = orig_do_dlopen_CIV(filename, flag, extinfo);
         onSoLoadedAfter(filename, ret);
         return ret;
@@ -80,7 +86,6 @@ namespace ZhenxiRunTime::linkerHandler {
 
     HOOK_DEF(void*, do_dlopen_CIVV, const char *name, int flags, const void *extinfo,
              void *caller_addr) {
-        char temp[PATH_MAX];
         void *ret = orig_do_dlopen_CIVV(name, flags, extinfo, caller_addr);
         onSoLoadedAfter(name,ret);
         return ret;
@@ -398,21 +403,17 @@ static void init() {
 
 void linkerHandler::linkerCallBack(std::ofstream *os) {
     if (os != nullptr) {
-        isSave = true;
-        hookStrHandlerOs = os;
+        hookStrHandlerOs.store(os);
+        isSave.store(true);
     } else {
-        LOG(ERROR) << ">>>>>>>>>>>>> string handler init fail hookStrHandlerOs == null  ";
+        LOG(ERROR) << ">>>>>>>>>>>>> linker handler os == null,只输出logcat  ";
     }
     init();
 }
 
 [[maybe_unused]]
 void linkerHandler::stopjnitrace() {
-    if (hookStrHandlerOs != nullptr) {
-        if (hookStrHandlerOs->is_open()) {
-            hookStrHandlerOs->close();
-        }
-        delete hookStrHandlerOs;
-    }
-    isSave = false;
+    // 文件流由 main.cpp 持有,这里只放弃引用(原来这里 delete 会造成 double free)
+    hookStrHandlerOs.store(nullptr);
+    isSave.store(false);
 }

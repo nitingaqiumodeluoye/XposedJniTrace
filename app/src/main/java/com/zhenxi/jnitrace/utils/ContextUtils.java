@@ -5,8 +5,6 @@ import android.app.Application;
 import android.content.Context;
 import android.os.Build;
 
-import org.lsposed.hiddenapibypass.HiddenApiBypass;
-
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -18,16 +16,9 @@ public class ContextUtils {
     @SuppressLint("StaticFieldLeak")
     private static Context sContext = null;
 
-    static {
-        try {
-            if (Build.VERSION.SDK_INT >= 28) {
-                //pass hide api check
-                HiddenApiBypass.addHiddenApiExemptions("");
-            }
-        } catch (Exception exception) {
-            CLog.e("ContextUtils static addHiddenApiExemptions error "+exception.getMessage());
-        }
-    }
+    // 说明:原来这里用 HiddenApiBypass 自己豁免 hidden api,
+    // Vector 框架已经对模块 ClassLoader 做了豁免(HookBridge.exemptModuleClassLoaderHiddenApi),
+    // 这里不再重复处理,避免和框架的豁免状态互相干扰。
 
     public static Context getContext(){
         if(sContext!=null){

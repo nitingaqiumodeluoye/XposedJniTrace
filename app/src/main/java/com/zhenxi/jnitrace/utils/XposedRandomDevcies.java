@@ -13,8 +13,8 @@ import java.io.DataOutputStream;
 import java.lang.reflect.Method;
 import java.util.Random;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedHelpers;
+import de.wwb.android.wbosed.XC_MethodHook;
+import de.wwb.android.wbosed.XposedHelpers;
 
 /**
  * Created by Zhenxi on
