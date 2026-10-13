@@ -5,6 +5,7 @@
 //#include <VAJni.h>
 
 #include <utility>
+#include <cstdlib>
 
 #include "includes/appUtils.h"
 #include "includes/HookUtils.h"
@@ -102,11 +103,50 @@ bool MPROTECT(size_t addr,size_t size,int __prot){
 #define BUF_SIZE 1024
 
 
+/**
+ * 从 /proc/self/maps 的一行里取出被映射的文件路径(第一个 '/' 起,到行尾)。
+ */
+static void mapLinePath(const char *line, char *out, size_t outSize) {
+    out[0] = '\0';
+    if (line == nullptr || outSize == 0) {
+        return;
+    }
+    const char *p = strchr(line, '/');
+    if (p == nullptr) {
+        return;
+    }
+    size_t n = 0;
+    while (p[n] != '\0' && p[n] != '\n' && (n + 1) < outSize) {
+        out[n] = p[n];
+        ++n;
+    }
+    out[n] = '\0';
+}
+
 MapItemInfo getSoBaseAddress(const char *name) {
     MapItemInfo info{0};
     if(name== nullptr){
         return info;
     }
+    //dlopen 传进来的路径不一定等于 /proc/self/maps 里显示的字符串,分三种情况兜:
+    //  1) 符号链接: dlopen("/vendor/lib64/hw/xxx.so") 在 maps 里显示的是解析后的
+    //     ".../hw/mt6895/xxx.so" —— Android 的 HAL impl so 大量如此,
+    //     只按原字符串匹配会得到 start=0(实测 android.hardware.graphics.mapper@4.0
+    //     -impl-mediatek.so 就踩了这个);
+    //  2) soname: dlopen("libc.so") 在 maps 里是完整路径,靠文件名兜;
+    //  3) APK 内 so: dlopen("/path/base.apk!/lib/arm64-v8a/libx.so") 在 maps 里
+    //     只有 apk 自身的映射,不含 so 名 —— 这种本质上取不到,返回 0 由调用方标注。
+    char realPath[PATH_MAX] = {};
+    if (realpath(name, realPath) == nullptr) {
+        realPath[0] = '\0';
+    }
+    const char *base = strrchr(name, '/');
+    base = (base != nullptr) ? (base + 1) : name;
+    const size_t baseLen = strlen(base);
+    //文件名兜底时的路径锚点:同名 so 可能在进程里有多份(不同目录/命名空间),
+    //只认第一次命中的那个路径,避免把另一个同名 so 的映射段算进来给出错误地址。
+    char baseAnchor[PATH_MAX] = {};
+
     size_t start = 0 ;
     size_t end = 0 ;
     bool isFirst = true;
@@ -124,7 +164,35 @@ MapItemInfo getSoBaseAddress(const char *name) {
     }
     char *line = nullptr;
     while (getline(&line, &len, fp) != -1) {
-        if (line!= nullptr&&strstr(line, name)) {
+        if (line == nullptr) {
+            continue;
+        }
+        bool matched = strstr(line, name) != nullptr;
+        if (!matched && realPath[0] != '\0') {
+            matched = strstr(line, realPath) != nullptr;
+        }
+        if (!matched && baseLen > 0) {
+            //按文件名兜:必须是".../文件名"形式,且文件名后紧跟行尾或空格,
+            //否则 "libx.so" 会误匹配到 "libx.so.bak" 这类;并且要求路径与锚点一致。
+            for (const char *hit = strstr(line, base); hit != nullptr;
+                 hit = strstr(hit + 1, base)) {
+                if (hit == line || *(hit - 1) != '/') {
+                    continue;
+                }
+                const char tail = hit[baseLen];
+                if (tail != '\0' && tail != '\n' && tail != '\r' && tail != ' ') {
+                    continue;
+                }
+                char linePath[PATH_MAX] = {};
+                mapLinePath(line, linePath, sizeof(linePath));
+                if (baseAnchor[0] == '\0') {
+                    snprintf(baseAnchor, sizeof(baseAnchor), "%s", linePath);
+                }
+                matched = strcmp(baseAnchor, linePath) == 0;
+                break;
+            }
+        }
+        if (matched) {
             sscanf(line, "%lx-%lx",&start, &end);
             //start 只有第一次赋值
             if(isFirst){

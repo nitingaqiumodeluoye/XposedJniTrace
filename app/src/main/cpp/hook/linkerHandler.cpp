@@ -67,12 +67,20 @@ namespace ZhenxiRunTime::linkerHandler {
             return;
         }
         auto mapInfo = getSoBaseAddress(filename);
-        char buffer[PATH_MAX] = {};
-        // size 是 size_t,原来用 %lu 在部分 ABI 上是未定义行为;原来也没换行,多条会连成一行
-        snprintf(buffer, sizeof(buffer),
-                 "linker load %s  start-> 0x%zx  end-> 0x%zx  size -> %zu  handle -> %p\n",
-                 filename, mapInfo.start, mapInfo.end,
-                 (mapInfo.end - mapInfo.start), handle);
+        char addrBuf[160] = {};
+        if (mapInfo.start != 0) {
+            snprintf(addrBuf, sizeof(addrBuf),
+                     "start-> 0x%zx  end-> 0x%zx  size -> %zu",
+                     mapInfo.start, mapInfo.end, mapInfo.end - mapInfo.start);
+        } else {
+            //APK 内加载的 so(/path/base.apk!/lib/arm64-v8a/libx.so)在 maps 里只有
+            //apk 自身的映射、不含 so 名,地址本质上取不到 —— 明确标注,
+            //不要输出 0x0 那种看着像真实地址的值。
+            snprintf(addrBuf, sizeof(addrBuf), "start-> (未知:zip内加载或匿名映射)");
+        }
+        char buffer[PATH_MAX + 256] = {};
+        snprintf(buffer, sizeof(buffer), "linker load %s  %s  handle -> %p\n",
+                 filename, addrBuf, handle);
         std::ofstream *os = linkerOs.load();
         if (isSave.load() && os != nullptr) {
             // 和 jnitrace / stringHandler / invokePrintf 共用同一把文件锁
