@@ -850,7 +850,14 @@ namespace ZhenxiRunTime::JniTrace {
     /**
      * 按Java参数类型从va_list里取值。
      *
-     * 必须和ART的行为完全一致,见 art/runtime/reflection.cc 的
+     * args 必须传引用:AArch64 的 va_list 是32字节结构体(struct __va_list),
+     * 按值传参会在每个调用点把描述符重新复制一份(编译后就是 ldp q0,q1,[原];
+     * stp q0,q1,[sp]; bl ...),被调函数里的 va_arg 推进只写回那份副本,
+     * 于是"每读一个参数都从第一个槽位重新开始"——所有参数全部重复成第一个值,
+     * 引用类型还会把整数当 jobject 交给 ART 解引用,直接 SIGSEGV。
+     * 这是实测过的:同一个va_list连续读4个参数,按值传时4次全返回slot0。
+     *
+     * 取值规则必须和ART的行为完全一致,见 art/runtime/reflection.cc 的
      * ArgArray::BuildArgArrayFromVarArgs:
      *   'Z'/'B'/'C'/'S'/'I' -> va_arg(jint)
      *   'F'                 -> va_arg(jdouble)   注意:C可变参数的默认实参提升会把float提升成double
@@ -861,7 +868,7 @@ namespace ZhenxiRunTime::JniTrace {
      * 原来是不管什么类型都 va_arg(jobject):arm32上long/double会读错位,
      * float参数会被当成double/指针,打印出来的全是垃圾甚至崩溃。
      */
-    static void fetchArgValue(va_list args, const string &typeName, jvalue &value) {
+    static void fetchArgValue(va_list &args, const string &typeName, jvalue &value) {
         if (typeName == "boolean") {
             value.z = (va_arg(args, jint) != 0) ? JNI_TRUE : JNI_FALSE;
         } else if (typeName == "byte") {
@@ -1068,6 +1075,10 @@ namespace ZhenxiRunTime::JniTrace {
             }
             return;
         }
+        //走查用的副本:必须自己用局部对象,且以引用方式往下传,
+        //否则每个参数都会从这个副本的起点重新开始读(见 fetchArgValue 注释)
+        va_list walk;
+        va_copy(walk, args);
         for (jint i = 0; i < paramCount; i++) {
             auto typeClassObj = env->GetObjectArrayElement(types, i);
             if (typeClassObj == nullptr) {
@@ -1079,7 +1090,7 @@ namespace ZhenxiRunTime::JniTrace {
             string typeName = getJObjectClassInfo(env, typeClassObj);
             env->DeleteLocalRef(typeClassObj);
             jvalue value{};
-            fetchArgValue(args, typeName, value);
+            fetchArgValue(walk, typeName, value);
             char indexBuf[48] = {};
             snprintf(indexBuf, sizeof(indexBuf), "args index [%d] ", static_cast<int>(i));
             const string linePrefix = withAddr
@@ -1092,6 +1103,7 @@ namespace ZhenxiRunTime::JniTrace {
             }
         }
         env->DeleteLocalRef(types);
+        va_end(walk);
     }
     //jstring NewStringUTF(const char* bytes)
     JNITRACE_HOOK_DEF(jstring, NewStringUTF, JNIEnv *env, const char *bytes) {
