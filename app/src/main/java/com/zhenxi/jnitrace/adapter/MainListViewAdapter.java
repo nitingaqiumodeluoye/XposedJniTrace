@@ -222,9 +222,27 @@ public class MainListViewAdapter extends BaseAdapter {
     }
 
     /**
-     * 很多加壳app
-     * shared = new XSharedPreferences(BuildConfig.APPLICATION_ID, "config"); 导致失效
-     * 通过root强行将数据保存一份到目标apk 私有目录
+     * 把配置写一份到目标 App 的私有目录(目标进程里的模块从那里读)。
+     *
+     * 为什么不只用 XSharedPreferences:很多加壳 App 上
+     * shared = new XSharedPreferences(BuildConfig.APPLICATION_ID, "config") 会失效,
+     * 所以额外用 root 强行写一份到目标 App 私有目录兜底。
+     *
+     * 关于写入方式的一个坑(真机实测):
+     * 原来是把模块自己创建的文件 mv 到目标目录 —— mv 是 rename(2),会保留源 inode
+     * 和它的 SELinux 标签。源文件是模块自己创建的,标签带的是**模块的 MCS 类别**
+     * (app_data_file:s0:c<模块appid>,...);而目标 App 的类别是 c<目标appid>。
+     * MCS 规则要求"主体类别集合 ⊇ 客体类别集合",两边类别不同,所以就算文件权限
+     * 是 777,SELinux 依然拒绝,目标进程读配置直接
+     *   java.io.FileNotFoundException: ... open failed: EACCES (Permission denied)
+     * 后果是这条兜底路静默失效(日志表现为 tag package name -> null,什么 hook 都不装),
+     * 而 chmod 777 修不了它 —— 这是 SELinux 不是 Unix 权限。
+     *
+     * 改成先在目标目录里 cp 出一个临时文件:cp 新建 inode,标签由 root 生成
+     * (app_data_file:s0,不带任何 MCS 类别);客体类别是空集,任何 App 的类别集合
+     * 都能覆盖它,于是目标 App 就能正常读了。
+     * 再同目录 mv 成正式名字:rename(2) 原子替换且保留刚拿到的正确标签,
+     * 顺带把历史遗留的错标签文件顶掉。
      */
     @SuppressWarnings("All")
     private void initConfig(String packageName, JSONObject jsonObject) {
@@ -247,19 +265,23 @@ public class MainListViewAdapter extends BaseAdapter {
 
             File temp = new File("/data/data/" + packageName);
             File tagFile = new File(temp.getPath() + "/" + BuildConfig.project_name + "Config");
-            if(tagFile.exists()){
-                RootUtils.execShell("rm -f " + tagFile.getPath());
-                CLog.i(">>>>>>>> initConfig rm -f finish  "+tagFile.getPath());
-            }
-            CLog.i(">>>>>>>>> start mv " +
-                    "file " + config.getPath() + "->" + temp);
-            //强制覆盖
-            RootUtils.execShell("mv -f " + config.getPath() + " " + temp);
-            //防止因为用户组权限问题导致open failed: EACCES (Permission denied)
-            CLog.i(">>>>>>>>>> chmod 777 path -> " + tagFile);
-            RootUtils.execShell("chmod 777  " + tagFile.getPath());
-            //尝试利用magisk本身的busybox命令,直接chmod有的手机会失败
-            RootUtils.execShell("busybox chmod 777  " + tagFile.getPath());
+            //先 cp 到临时名再 mv 成正式名:cp 负责拿到无 MCS 类别的标签,mv 负责原子替换。
+            //
+            //三条命令必须用 && 连成一条一次性交给 su,不能拆成多次 execShell:
+            //原来的 execShell 写进 su 的 stdin 就返回、不等 waitFor,多次调用会各自起一个 su,
+            //顺序毫无保证(rm/cp/mv 乱序执行会直接搞出半个配置文件)。
+            //(execShell 那边也已经改成同步了,但一条命令本身就是更硬的保证。)
+            final String tmpPath = tagFile.getPath() + ".tmp";
+            CLog.i(">>>>>>>>> copy config " + config.getPath() + " -> " + tagFile.getPath());
+            //关键链路用 && 连成一条,顺序有保证
+            RootUtils.execShell("rm -f " + tmpPath
+                    + " && cp -f " + config.getPath() + " " + tmpPath
+                    + " && mv -f " + tmpPath + " " + tagFile.getPath()
+                    //SELinux 那关靠 cp 解决;这里只是补 Unix 文件权限(默认权限取决于 umask,
+                    //root 建的 600 文件目标 App 依然读不了)
+                    + " && chmod 777 " + tagFile.getPath());
+            //尝试利用magisk本身的busybox命令,直接chmod有的手机会失败(失败无所谓,放关键链路之外)
+            RootUtils.execShell("busybox chmod 777 " + tagFile.getPath());
             CLog.i(">>>>>>>> initConfig finish  ");
         } catch (Throwable e) {
             CLog.e("initConfig error  " + e, e);

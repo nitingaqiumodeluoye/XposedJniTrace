@@ -190,7 +190,14 @@ public class LHook extends WbModule {
                     configInfo = FileUtils.readToString(file);
                     CLog.i("start read config success  " + configInfo);
                 } catch (Throwable e) {
-                    CLog.e("read root file config error " + e, e);
+                    //这里最常见的是 EACCES (Permission denied)。它不是 Unix 权限问题,
+                    //而是 SELinux 的 MCS 类别不匹配:配置文件是从模块自己的目录弄过来的,
+                    //标签带的是模块自己的类别(app_data_file:s0:c<模块appid>),
+                    //目标 App 的类别是 c<目标appid>,两边不同 → SELinux 直接拒绝,
+                    //chmod 777 一点用没有。
+                    //解法在写入侧(MainListViewAdapter.initConfig):用 cp 新建文件而不是 mv,
+                    //让文件拿到不带 MCS 类别的标签。
+                    CLog.e("read root file config error (若是 EACCES 请看写入侧是否用了 cp 而不是 mv) " + e, e);
                 }
                 initConfigData(configInfo);
             }

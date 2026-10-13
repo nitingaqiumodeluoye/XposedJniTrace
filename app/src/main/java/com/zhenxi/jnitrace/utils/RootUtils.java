@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Created by Lyh on
@@ -82,42 +83,64 @@ public class RootUtils {
         return true;
     }
 
-    public static void execShell(String cmd){
-        OutputStream outputStream=null;
-        DataOutputStream dataOutputStream=null;
-        try{
-
-            Runtime runtime = Runtime.getRuntime();
-            runtime.exec(cmd+"\n");
-            //权限设置
-            Process p = Runtime.getRuntime().exec("su");
-            //获取输出流
-            outputStream =  p.getOutputStream();
-            dataOutputStream =new DataOutputStream(outputStream);
-            //将命令写入
-            dataOutputStream.writeBytes(cmd+ "\n");
-            //提交命令
-            dataOutputStream.flush();
-
+    /**
+     * 以 root 执行一条命令,并等待它真正执行完返回。
+     *
+     * 原实现有三个问题(都会直接坑到调用方):
+     *   1) 先用 runtime.exec(cmd) 跑了一遍**非 root**的命令 —— 结果丢弃,
+     *      对 /data/data/<别的包> 这种路径必然失败("Permission denied"),纯粹白跑;
+     *      而且 cmd+"\n" 里的换行会被拼进最后一个参数。
+     *   2) 命令写进 su 的 stdin 之后立刻就 close 并返回,没有 waitFor(),
+     *      调用方以为执行完了其实还在跑。
+     *   3) 于是连着写的多条命令(如 rm -> cp -> mv)各自起一个 su,顺序完全没有保证,
+     *      可能乱序执行 —— 写配置文件那里就会因此偶尔只剩半个文件。
+     *
+     * 现在:同一个 su 里写入"命令 + exit",并用 waitFor(5s) 等它结束。
+     * 加超时是为了防 su 卡死把调用方(可能在主线程)挂住。
+     * 调用方仍然应该把多条有前后依赖的命令用 && 连成一条 —— 比依赖多次调用更稳。
+     */
+    public static void execShell(String cmd) {
+        if (cmd == null || cmd.trim().isEmpty()) {
+            return;
         }
-        catch(Throwable t){
-            CLog.e("execShell error "+t.getMessage());
+        Process process = null;
+        OutputStream outputStream = null;
+        DataOutputStream dataOutputStream = null;
+        try {
+            process = Runtime.getRuntime().exec("su");
+            outputStream = process.getOutputStream();
+            dataOutputStream = new DataOutputStream(outputStream);
+            dataOutputStream.writeBytes(cmd + "\n");
+            //让 su 执行完就退出,否则 waitFor() 会一直等输入
+            dataOutputStream.writeBytes("exit\n");
+            dataOutputStream.flush();
+            dataOutputStream.close();
+            dataOutputStream = null;
+            outputStream = null;
+            if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                CLog.e("execShell timeout(5s) cmd= " + cmd);
+            }
+        } catch (Throwable t) {
+            CLog.e("execShell error " + t.getMessage() + " cmd= " + cmd);
             t.printStackTrace();
-        }finally {
-           if(outputStream!=null){
-               try {
-                   outputStream.close();
-               } catch (IOException e) {
-                   e.printStackTrace();
-               }
-           }
-           if(dataOutputStream!=null){
-               try {
-                   dataOutputStream.close();
-               } catch (IOException e) {
-                   e.printStackTrace();
-               }
-           }
+        } finally {
+            if (dataOutputStream != null) {
+                try {
+                    dataOutputStream.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+            if (outputStream != null) {
+                try {
+                    outputStream.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+            if (process != null) {
+                process.destroy();
+            }
         }
     }
 }
