@@ -5,6 +5,12 @@
 
 > 上游实现见 [w296488320/XposedJniTrace](https://github.com/…)(老 Xposed + `Runtime.nativeLoad` 注入版)。
 > 本仓库已改造为 **Vector soLoader 基线的 native 模块**。
+>
+> **本仓库是 jnitrace 的主力维护目标。** trace 核心(`JnitraceForC.cpp` /
+> `stringHandler.cpp` / `traceLog.h`)是从 [JnitraceForCpp](../JnitraceForCpp)
+> 融合过来的同一份拷贝,那个仓库已冻结为归档(保留"独立 so"形态与
+> `xunwind`/`hidemaps`/`Dobby` 等 nativeLib 能力,详见它的 `MAINTENANCE.md`)。
+> 所以这两个文件以后**只在这里改**,不要再回去改 JnitraceForCpp 那一份。
 
 ---
 
@@ -17,7 +23,7 @@
 | native 入口 | `JNI_OnLoad` | 导出 `native_init(const NativeAPIEntries*)` |
 | inline hook | Dobby + sandhook 三级降级 | Vector 下发的 **wxshadow**(`entries->hookFunc`) |
 | ABI | armeabi-v7a + arm64-v8a | **arm64-v8a**(Vector soLoader 当前只支持它) |
-| 配置传递 | root `mv` 到目标 data 目录 | `XSharedPreferences`(`xposedsharedprefs`,免 root),root 方式保留为兜底 |
+| 配置传递 | root `mv` 到目标 data 目录 | root 写到目标 data 目录(**已修 SELinux 问题**,见下),XSP 路实测不通 |
 | 反盗版 | 证书 MD5 校验 + `System.exit(9)` | 保留(必须用仓库自带的 `jnitraceKey.jks` 签名) |
 
 ---
@@ -48,8 +54,7 @@ MODERN 路线拿不到 `LoadPackageParam`，所以目标包名从进程名推导
 1. **安装本 APK**(release,非 debuggable,由 `jnitraceKey.jks` 签名)。
 2. 在 **Vector 管理器**里勾选本模块为启用模块。
 3. 打开模块 App → 选择目标 App → 填过滤关键字 → 勾选功能 → 确定。
-   配置会由 App 用 root 写到 `/data/data/<目标包>/FunJniConfig`
-   (同时写一份到模块自己的 `XSharedPreferences`，目标进程优先读它、失败再读文件)。
+   配置由 App 用 root 写到 `/data/data/<目标包>/FunJniConfig`(见下面"配置是怎么传过去的")。
 4. 把目标 App 加进本模块的作用域，**重启目标 App**(模块在进程启动早期注入，配置需要一次冷启动)。
 
 ### 配置项
@@ -150,6 +155,36 @@ nativeLib/src/main/cpp/      native 基础库(被 app 的 CMake add_subdirectory
 9. **double free**：各模块的 `stopjnitrace()` 都 `delete` 同一个 `ofstream`。
 10. **过滤列表越界**：固定 100 项不校验下标。
 11. **`memcpy` hook 判断写反**，且把非 `\0` 结尾内存当字符串打印会越界读。
+12. **配置传不到目标 App：SELinux MCS 类别**。模块 App 自己创建配置后 `mv` 过去，
+    而 `mv` 是 `rename(2)`、保留源 inode 和它的 SELinux 标签——标签带的是模块自己的
+    MCS 类别(`app_data_file:s0:c<模块appid>`)，目标 App 的类别是`c<目标appid>`，
+    两边不同 → SELinux 直接拒绝，**文件即使 `chmod 777` 也读不了**。
+    现象是 `open failed: EACCES (Permission denied)`，然后
+    `tag package name -> null`、一个 hook 都不装（功能静默失效）。
+    现在改成在目标目录 `cp` 新建(`cp` 由 root 创建，标签是 `app_data_file:s0`，
+    不带 MCS 类别，任何 App 都能读)，再同目录 `mv` 原子替换成正式名。
+    注意：换目标 App 时旧配置文件标签仍是错的，重新点一次“确定”即可。
+13. **`RootUtils.execShell` 不同步**：先跑一遍非 root 的同一条命令(白跑)、
+    写完 `su` 的 stdin 就立刻返回不等 `waitFor`；于是连续调用的 `rm`/`cp`/`mv`
+    各自起一个 `su`、**顺序毫无保证**(可能搞出半个配置文件)。
+    现在同一 `su` 里写 `命令 + exit` 并 `waitFor(5s)`，写配置那几条合并成一条 `&&` 链。
+14. **`RegisterNative` 符号位置搬过家**：`art::ArtMethod::RegisterNative` 在
+    Android 8 之后已从 libart 移除，现在是
+    `art::ClassLinker::RegisterNative(Thread*, ArtMethod*, const void*)`。
+    只认老符号会让功能 2 静默失效。现在按新→旧多候选查找。
+15. **`getSoBaseAddress` 遇行号链接拿不到地址**：`dlopen("/vendor/lib64/hw/x.so")`
+    是行号链接，而 maps 里显示的是解析后的真实路径(`hw/mt6895/x.so`)，
+    完整路径 `strstr` 匹配失败 → 返回 0。Android 的 HAL impl so 大量如此。
+    现在按 原样路径 → `realpath` 解析后 → 文件名兜底(带路径锚点防同名串味) 依次匹配。
+16. **功能 3 不该自己抢 `do_dlopen`**：Vector 框架自己已经用 wxshadow 挂了同一个地址，
+    同址二次 hook 必失败(`ret=-8`)。而框架那次 hook 干的正是同样的事，
+    所以改成吃框架的加载通知(`native_init` 返回的回调)，代码从 418 行缩到 98 行。
+17. **功能 0 参数错位（AArch64 `va_list` 按值传参会丢推进）**：`va_list` 是 32 字节
+    结构体，按值传参时编译器在每个调用点重新复制描述符，被调函数里的 `va_arg`
+    推进只写回副本 → 每读一个参数都从第一个槽位重新开始。表现为多参数调用的
+    参数全部重复成第一个值，更严重的是把整数当 `jobject` 交给 ART，
+    `Thread::DecodeJObject` 解引用未映射地址直接 SIGSEGV(实测 hunter、localsend 秒崩)。
+    现在 `fetchArgValue` 改收 `va_list&`，`getArgsInfo` 内部显式 `va_copy` 一份走查。
 
 ---
 

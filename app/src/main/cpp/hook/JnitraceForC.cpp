@@ -12,6 +12,8 @@
 #include <cstring>
 #include <mutex>
 #include <sstream>
+#include <unordered_map>
+#include <vector>
 
 namespace ZhenxiRunTime::JniTrace {
 
@@ -109,6 +111,13 @@ namespace ZhenxiRunTime::JniTrace {
 #define GET_METHOD_INFO_ARGS(env, obj, methodid, args, isStatic) \
     getArgsInfo(env,obj,methodid,args,isStatic); \
     va_end(args);
+
+/**
+ * A 变体(Call*MethodA / NewObjectA)的参数打印。
+ * 参数是 const jvalue*, 不需要 va_end。
+ */
+#define GET_METHOD_INFO_ARGS_A(env, obj, methodid, args, isStatic) \
+    getArgsInfoFromArray(env,obj,methodid,args,isStatic);
 
 /**
  * 每个hook在调用orig_xxx之前,先把va_list复制一份出来专门用于打印。
@@ -218,6 +227,165 @@ namespace ZhenxiRunTime::JniTrace {
     }
 
     //jobject CallObjectMethod(JNIEnv*, jobject, jmethodID, va_list args);
+    //--------------------------方法ID缓存----------------------------
+    //
+    // 加固后的 so(如 GameVMP)只通过 JNI 调 Java 方法, 日志里原先只有 mid 地址,
+    // 看不出调的是哪个方法。这里把 GetMethodID/GetStaticMethodID 的结果记下来,
+    // Call*Method 命中时直接查表拿到 类名/方法名/签名。
+    //
+    // 用 mid 作为 key: mid 在 ART 里就是 ArtMethod*, 同一个 mid 必然对应同一个方法。
+    // 这是解析加固 so 调用链的关键 —— 没有它, 遇到 CallObjectMethodA(参数是 jvalue 数组)
+    // 时根本无法得知该怎么解释那段数组。
+    struct CachedMethodInfo {
+        string className;
+        string name;
+        string signature;
+    };
+
+    static std::mutex gMethodInfoMutex;
+    static std::unordered_map<jmethodID, CachedMethodInfo> gMethodInfoCache;
+
+    /**
+     * 缓存上限, 防止长时间运行无限增长(超出后不再新增, 已缓存条目仍可用)
+     */
+    static constexpr size_t MAX_METHOD_CACHE = 16384;
+
+    static void cacheMethodInfo(jmethodID mid, const string &className, const char *name,
+                                const char *sig) {
+        if (mid == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(gMethodInfoMutex);
+        if (gMethodInfoCache.size() >= MAX_METHOD_CACHE) {
+            return;
+        }
+        CachedMethodInfo info;
+        info.className = className;
+        info.name = name == nullptr ? "" : name;
+        info.signature = sig == nullptr ? "" : sig;
+        gMethodInfoCache[mid] = info;
+    }
+
+    static bool lookupMethodInfo(jmethodID mid, CachedMethodInfo &out) {
+        if (mid == nullptr) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(gMethodInfoMutex);
+        auto it = gMethodInfoCache.find(mid);
+        if (it == gMethodInfoCache.end()) {
+            return false;
+        }
+        out = it->second;
+        return true;
+    }
+
+    static string formatMethodInfoLine(const CachedMethodInfo &info) {
+        return "invoke method  " + info.className + "." + info.name + info.signature;
+    }
+
+    /**
+     * 把JNI方法签名拆成单个参数的签名片段。
+     *   "(ILjava/lang/String;[B)V" -> {"I","Ljava/lang/String;","[B"}
+     * 返回 false 表示签名畸形, 调用方应回退到反射方式。
+     */
+    static bool parseMethodSignature(const string &sig, std::vector<string> &types) {
+        if (sig.empty() || sig[0] != '(') {
+            return false;
+        }
+        size_t i = 1;
+        while (i < sig.size() && sig[i] != ')') {
+            const size_t start = i;
+            while (i < sig.size() && sig[i] == '[') {
+                ++i;
+            }
+            if (i >= sig.size()) {
+                return false;
+            }
+            if (sig[i] == 'L') {
+                const size_t end = sig.find(';', i);
+                if (end == string::npos) {
+                    return false;
+                }
+                i = end + 1;
+            } else if (strchr("ZBCSIJFD", sig[i]) != nullptr) {
+                ++i;
+            } else {
+                return false;
+            }
+            types.push_back(sig.substr(start, i - start));
+        }
+        return i < sig.size() && sig[i] == ')';
+    }
+
+    /**
+     * 把参数签名片段转成类型名(供 fetchArgValue / formatArgValue 使用)。
+     *   "I" -> "int"   "Ljava/lang/String;" -> "java.lang.String"   "[B" -> "[B"
+     */
+    static string sigToTypeName(const string &s) {
+        if (s.size() == 1) {
+            switch (s[0]) {
+                case 'Z': return "boolean";
+                case 'B': return "byte";
+                case 'C': return "char";
+                case 'S': return "short";
+                case 'I': return "int";
+                case 'J': return "long";
+                case 'F': return "float";
+                case 'D': return "double";
+                case 'V': return "void";
+                default: return s;
+            }
+        }
+        if (s[0] == '[') {
+            //数组直接给 getJavaArrayString 认的签名形式("[B"/"[I"/... )
+            return s;
+        }
+        if (s[0] == 'L' && s.size() >= 2) {
+            string n = s.substr(1, s.size() - 2);
+            for (char &ch: n) {
+                if (ch == '/') {
+                    ch = '.';
+                }
+            }
+            return n;
+        }
+        return s;
+    }
+
+    /**
+     * 从 jvalue 数组取第 index 个参数。
+     *
+     * A 变体(Call*MethodA/NewObjectA)的参数是 `const jvalue*`: jvalue 是 union,
+     * 在 64 位下 sizeof(jvalue) == 8, 所以数组下标与参数序号一一对应。
+     * 这比 V 变体好处理得多 —— 不需要 va_list, 也不会把参数读错位。
+     */
+    static void fetchArrayArgValue(const jvalue *args, size_t index, const string &typeName,
+                                   jvalue &value) {
+        if (args == nullptr) {
+            value.l = nullptr;
+            return;
+        }
+        const jvalue &src = args[index];
+        if (typeName == "boolean") {
+            value.z = src.z;
+        } else if (typeName == "byte") {
+            value.b = src.b;
+        } else if (typeName == "char") {
+            value.c = src.c;
+        } else if (typeName == "short") {
+            value.s = src.s;
+        } else if (typeName == "int") {
+            value.i = src.i;
+        } else if (typeName == "long") {
+            value.j = src.j;
+        } else if (typeName == "float") {
+            value.f = src.f;
+        } else if (typeName == "double") {
+            value.d = src.d;
+        } else {
+            value.l = src.l;
+        }
+    }
     JNI_HOOK_DEF(jobject, CallObjectMethodV, JNIEnv *env, jobject obj, jmethodID jmethodId,
                  va_list args)
         DL_INFO
@@ -230,6 +398,189 @@ namespace ZhenxiRunTime::JniTrace {
             return ret;
         }
         return orig_CallObjectMethodV(env, obj, jmethodId, args);
+    }
+
+    //--------------------------A 变体(jvalue 数组)----------------------------
+    //
+    // 加固后的 so 普遍用 A 变体而不是 V 变体: A 变体的参数是一段连续的 jvalue 数组,
+    // 比 va_list 好构造也好传递。GameVMP 就是这样 —— 它调用 Java 方法几乎全走 A 变体,
+    // 而原来只 hook 了 V 变体, 于是整条调用链在日志里是空白的。
+    //
+    // 注意: 这里不使用 JNI_HOOK_DEF 宏 —— 宏会把原函数声明成 varargs(...),
+    // 而 A 变体实际是 (const jvalue*), 类型不匹配时传递参数是未定义行为。
+
+    static jobject (*orig_CallObjectMethodA)(JNIEnv *env, jobject obj, jmethodID jmethodId,
+                                             const jvalue *args) = nullptr;
+
+    static jobject new_CallObjectMethodA(JNIEnv *env, jobject obj, jmethodID jmethodId,
+                                         const jvalue *args) {
+        DL_INFO
+        IS_MATCH
+            jobject ret = orig_CallObjectMethodA(env, obj, jmethodId, args);
+            GET_JOBJECT_INFO(env, obj, "CallObjectMethodA")
+            GET_METHOD_INFO_ARGS_A(env, obj, jmethodId, args, false)
+            getJObjectInfoInternal(env, ret, "result object :", true, "");
+            return ret;
+        }
+        return orig_CallObjectMethodA(env, obj, jmethodId, args);
+    }
+
+    static jobject (*orig_CallStaticObjectMethodA)(JNIEnv *env, jclass clazz, jmethodID jmethodId,
+                                                   const jvalue *args) = nullptr;
+
+    static jobject new_CallStaticObjectMethodA(JNIEnv *env, jclass clazz, jmethodID jmethodId,
+                                               const jvalue *args) {
+        DL_INFO
+        IS_MATCH
+            jobject ret = orig_CallStaticObjectMethodA(env, clazz, jmethodId, args);
+            GET_JOBJECT_INFO(env, clazz, "CallStaticObjectMethodA")
+            GET_METHOD_INFO_ARGS_A(env, clazz, jmethodId, args, true)
+            getJObjectInfoInternal(env, ret, "result object :", true, "");
+            return ret;
+        }
+        return orig_CallStaticObjectMethodA(env, clazz, jmethodId, args);
+    }
+
+    static void (*orig_CallStaticVoidMethodA)(JNIEnv *env, jclass clazz, jmethodID jmethodId,
+                                              const jvalue *args) = nullptr;
+
+    static void new_CallStaticVoidMethodA(JNIEnv *env, jclass clazz, jmethodID jmethodId,
+                                          const jvalue *args) {
+        DL_INFO
+        IS_MATCH
+            GET_JOBJECT_INFO(env, clazz, "CallStaticVoidMethodA")
+            GET_METHOD_INFO_ARGS_A(env, clazz, jmethodId, args, true)
+            orig_CallStaticVoidMethodA(env, clazz, jmethodId, args);
+            return;
+        }
+        orig_CallStaticVoidMethodA(env, clazz, jmethodId, args);
+    }
+
+    static jboolean (*orig_CallStaticBooleanMethodA)(JNIEnv *env, jclass clazz,
+                                                     jmethodID jmethodId,
+                                                     const jvalue *args) = nullptr;
+
+    static jboolean new_CallStaticBooleanMethodA(JNIEnv *env, jclass clazz, jmethodID jmethodId,
+                                                 const jvalue *args) {
+        DL_INFO
+        IS_MATCH
+            jboolean ret = orig_CallStaticBooleanMethodA(env, clazz, jmethodId, args);
+            GET_JOBJECT_INFO(env, clazz, "CallStaticBooleanMethodA")
+            GET_METHOD_INFO_ARGS_A(env, clazz, jmethodId, args, true)
+            write("result Boolean :  " + to_string(static_cast<int>(ret)) + "\n");
+            return ret;
+        }
+        return orig_CallStaticBooleanMethodA(env, clazz, jmethodId, args);
+    }
+
+    static jint (*orig_CallStaticIntMethodA)(JNIEnv *env, jclass clazz, jmethodID jmethodId,
+                                             const jvalue *args) = nullptr;
+
+    static jint new_CallStaticIntMethodA(JNIEnv *env, jclass clazz, jmethodID jmethodId,
+                                         const jvalue *args) {
+        DL_INFO
+        IS_MATCH
+            jint ret = orig_CallStaticIntMethodA(env, clazz, jmethodId, args);
+            GET_JOBJECT_INFO(env, clazz, "CallStaticIntMethodA")
+            GET_METHOD_INFO_ARGS_A(env, clazz, jmethodId, args, true)
+            write("result Int :  " + to_string(ret) + "\n");
+            return ret;
+        }
+        return orig_CallStaticIntMethodA(env, clazz, jmethodId, args);
+    }
+
+    static jlong (*orig_CallStaticLongMethodA)(JNIEnv *env, jclass clazz, jmethodID jmethodId,
+                                               const jvalue *args) = nullptr;
+
+    static jlong new_CallStaticLongMethodA(JNIEnv *env, jclass clazz, jmethodID jmethodId,
+                                           const jvalue *args) {
+        DL_INFO
+        IS_MATCH
+            jlong ret = orig_CallStaticLongMethodA(env, clazz, jmethodId, args);
+            GET_JOBJECT_INFO(env, clazz, "CallStaticLongMethodA")
+            GET_METHOD_INFO_ARGS_A(env, clazz, jmethodId, args, true)
+            write("result Long :  " + to_string(ret) + "\n");
+            return ret;
+        }
+        return orig_CallStaticLongMethodA(env, clazz, jmethodId, args);
+    }
+
+    static void (*orig_CallVoidMethodA)(JNIEnv *env, jobject obj, jmethodID jmethodId,
+                                        const jvalue *args) = nullptr;
+
+    static void new_CallVoidMethodA(JNIEnv *env, jobject obj, jmethodID jmethodId,
+                                    const jvalue *args) {
+        DL_INFO
+        IS_MATCH
+            GET_JOBJECT_INFO(env, obj, "CallVoidMethodA")
+            GET_METHOD_INFO_ARGS_A(env, obj, jmethodId, args, false)
+            orig_CallVoidMethodA(env, obj, jmethodId, args);
+            return;
+        }
+        orig_CallVoidMethodA(env, obj, jmethodId, args);
+    }
+
+    static jboolean (*orig_CallBooleanMethodA)(JNIEnv *env, jobject obj, jmethodID jmethodId,
+                                               const jvalue *args) = nullptr;
+
+    static jboolean new_CallBooleanMethodA(JNIEnv *env, jobject obj, jmethodID jmethodId,
+                                           const jvalue *args) {
+        DL_INFO
+        IS_MATCH
+            jboolean ret = orig_CallBooleanMethodA(env, obj, jmethodId, args);
+            GET_JOBJECT_INFO(env, obj, "CallBooleanMethodA")
+            GET_METHOD_INFO_ARGS_A(env, obj, jmethodId, args, false)
+            write("result Boolean :  " + to_string(static_cast<int>(ret)) + "\n");
+            return ret;
+        }
+        return orig_CallBooleanMethodA(env, obj, jmethodId, args);
+    }
+
+    static jint (*orig_CallIntMethodA)(JNIEnv *env, jobject obj, jmethodID jmethodId,
+                                       const jvalue *args) = nullptr;
+
+    static jint new_CallIntMethodA(JNIEnv *env, jobject obj, jmethodID jmethodId,
+                                   const jvalue *args) {
+        DL_INFO
+        IS_MATCH
+            jint ret = orig_CallIntMethodA(env, obj, jmethodId, args);
+            GET_JOBJECT_INFO(env, obj, "CallIntMethodA")
+            GET_METHOD_INFO_ARGS_A(env, obj, jmethodId, args, false)
+            write("result Int :  " + to_string(ret) + "\n");
+            return ret;
+        }
+        return orig_CallIntMethodA(env, obj, jmethodId, args);
+    }
+
+    static jlong (*orig_CallLongMethodA)(JNIEnv *env, jobject obj, jmethodID jmethodId,
+                                         const jvalue *args) = nullptr;
+
+    static jlong new_CallLongMethodA(JNIEnv *env, jobject obj, jmethodID jmethodId,
+                                     const jvalue *args) {
+        DL_INFO
+        IS_MATCH
+            jlong ret = orig_CallLongMethodA(env, obj, jmethodId, args);
+            GET_JOBJECT_INFO(env, obj, "CallLongMethodA")
+            GET_METHOD_INFO_ARGS_A(env, obj, jmethodId, args, false)
+            write("result Long :  " + to_string(ret) + "\n");
+            return ret;
+        }
+        return orig_CallLongMethodA(env, obj, jmethodId, args);
+    }
+
+    static jobject (*orig_NewObjectA)(JNIEnv *env, jclass clazz, jmethodID jmethodId,
+                                      const jvalue *args) = nullptr;
+
+    static jobject new_NewObjectA(JNIEnv *env, jclass clazz, jmethodID jmethodId,
+                                  const jvalue *args) {
+        DL_INFO
+        IS_MATCH
+            jobject obj = orig_NewObjectA(env, clazz, jmethodId, args);
+            GET_JOBJECT_INFO(env, obj, "NewObjectA")
+            GET_METHOD_INFO_ARGS_A(env, clazz, jmethodId, args, true)
+            return obj;
+        }
+        return orig_NewObjectA(env, clazz, jmethodId, args);
     }
 
     //void CallVoidMethod(jobject obj, jmethodID methodID, va_list args)
@@ -654,40 +1005,114 @@ namespace ZhenxiRunTime::JniTrace {
     }
 
     /**
+     * 单条日志里最多 dump 多少个原始字节。
+     * hex 是 2 字符/字节, ascii 是 1 字符/字节, 取 MAX_PRINT_SIZE/3 保证整行不超上限。
+     */
+    static constexpr jsize MAX_DUMP_BYTES = static_cast<jsize>(MAX_PRINT_SIZE / 3);
+
+    /**
+     * 把原始字节渲染成 hex, 附一列可打印 ASCII。
+     *
+     * 二进制数据一律走这里, 不做任何字符集解码 —— 见 byteArrayToHexView 的注释。
+     */
+    static string bytesToHexView(const jbyte *data, jsize total, jsize dumped) {
+        static const char *kHex = "0123456789abcdef";
+        string hex;
+        string ascii;
+        hex.reserve(static_cast<size_t>(dumped) * 2);
+        ascii.reserve(static_cast<size_t>(dumped));
+        for (jsize i = 0; i < dumped; ++i) {
+            auto c = static_cast<unsigned char>(data[i]);
+            hex.push_back(kHex[c >> 4]);
+            hex.push_back(kHex[c & 0x0F]);
+            ascii.push_back((c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '.');
+        }
+        string out = hex;
+        out += "  ascii=";
+        out += ascii;
+        if (total > dumped) {
+            out += "  ...(truncated)";
+        }
+        return out;
+    }
+
+    /**
+     * [B 的 hex + ASCII 视图。
+     *
+     * 原实现走 new String(bytes, "UTF-8") 再转 std::string:
+     * 二进制里的非法 UTF-8 字节会被解码成 U+FFFD 替换符(日志里就是乱码方块),
+     * 原始字节就此丢失 —— 签名/密文/协议帧这类数据一旦被替换就再也还原不出来。
+     * 现在不做任何字符集解码: 一律输出 hex, 另附 ASCII 列方便肉眼定位其中的文本片段。
+     */
+    static string byteArrayToHexView(JNIEnv *env, jbyteArray array) {
+        if (env == nullptr || array == nullptr) {
+            return "null";
+        }
+        jsize total = env->GetArrayLength(array);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            return {};
+        }
+        if (total <= 0) {
+            return "[B len=0]";
+        }
+        const jsize dumped = total < MAX_DUMP_BYTES ? total : MAX_DUMP_BYTES;
+        jbyte buf[MAX_DUMP_BYTES + 8] = {};
+        env->GetByteArrayRegion(array, 0, dumped, buf);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            return {};
+        }
+        return "[B len=" + to_string(total) + "  hex=" + bytesToHexView(buf, total, dumped);
+    }
+
+    /**
+     * C 字符串转义: 可打印字符原样输出, 其余按 \xNN 转义。
+     *
+     * NewStringUTF / GetStringUTFChars 的入参是 char*, 内容不保证是文本
+     * (协议帧、密文都会走这条路径)。原来直接 append 进日志:
+     * 非 UTF-8 字节会被日志层替换成 U+FFFD, 原始字节丢失且无法还原,
+     * 而 hex 视图是纯 ASCII, 永远不会被替换。
+     */
+    static string escapeCString(const char *data, size_t maxLen) {
+        if (data == nullptr) {
+            return "null";
+        }
+        static const char *kHex = "0123456789abcdef";
+        string out;
+        out.reserve(64);
+        for (size_t i = 0; i < maxLen; ++i) {
+            auto c = static_cast<unsigned char>(data[i]);
+            if (c == 0) {
+                break;
+            }
+            if (c == '\n') {
+                out += "\\n";
+            } else if (c == '\r') {
+                out += "\\r";
+            } else if (c == '\t') {
+                out += "\\t";
+            } else if (c >= 0x20 && c < 0x7F) {
+                out.push_back(static_cast<char>(c));
+            } else {
+                out += "\\x";
+                out.push_back(kHex[c >> 4]);
+                out.push_back(kHex[c & 0x0F]);
+            }
+        }
+        return out;
+    }
+
+    /**
      * 取java数组的文本表示。
-     * byte[]走 new String(bytes, "UTF-8")(顺便能看出明文),其余类型走 java.util.Arrays.toString
+     * byte[]走 hex 视图(不做字符集解码, 不丢原始字节),其余类型走 java.util.Arrays.toString
      */
     static string getJavaArrayString(JNIEnv *env, jobject array, const string &classInfo) {
         if (env == nullptr || array == nullptr) {
             return "null";
         }
         if (classInfo == "[B") {
-            jclass stringClazz = env->FindClass("java/lang/String");
-            if (stringClazz == nullptr) {
-                if (env->ExceptionCheck()) {
-                    env->ExceptionClear();
-                }
-                return {};
-            }
-            jmethodID initId = env->GetMethodID(stringClazz, "<init>", "([BLjava/lang/String;)V");
-            jstring charsetName = env->NewStringUTF("UTF-8");
-            jstring strRet = nullptr;
-            if (initId != nullptr && charsetName != nullptr) {
-                strRet = (jstring) env->NewObject(stringClazz, initId, array, charsetName);
-            }
-            if (charsetName != nullptr) {
-                env->DeleteLocalRef(charsetName);
-            }
-            env->DeleteLocalRef(stringClazz);
-            if (strRet == nullptr) {
-                if (env->ExceptionCheck()) {
-                    env->ExceptionClear();
-                }
-                return {};
-            }
-            string ret = jstringToStdString(env, strRet);
-            env->DeleteLocalRef(strRet);
-            return ret;
+            return byteArrayToHexView(env, reinterpret_cast<jbyteArray>(array));
         }
 
         jclass arraysClazz = env->FindClass("java/util/Arrays");
@@ -904,6 +1329,59 @@ namespace ZhenxiRunTime::JniTrace {
     }
 
     /**
+     * 用方法ID缓存的签名直接打印方法名与全部参数。
+     *
+     * 相比反射(ToReflectedMethod + getParameterTypes)的优势:
+     *   1) 不往 Java 层绕, 不会在打印自己时再触发一堆 JNI 调用;
+     *   2) 加固 so 直接拿 mid 调用时, 反射未必能拿到完整信息, 而签名是 GetMethodID 当场记的;
+     *   3) A 变体的参数是 jvalue 数组, 必须先知道签名才能解释那段内存 —— 这是唯一可行途径。
+     *
+     * @param readArg 取值回调: (参数序号, 参数签名片段) -> jvalue
+     * @return true 表示缓存命中且签名可解析(已打印完毕)
+     */
+    template<typename ReadArg>
+    static bool printArgsFromCache(JNIEnv *env, const CachedMethodInfo &cached, ReadArg readArg) {
+        std::vector<string> paramTypes;
+        if (!parseMethodSignature(cached.signature, paramTypes)) {
+            return false;
+        }
+        write(formatMethodInfoLine(cached) + "\n");
+        for (size_t i = 0; i < paramTypes.size(); ++i) {
+            const string typeName = sigToTypeName(paramTypes[i]);
+            jvalue value{};
+            readArg(i, paramTypes[i], value);
+            char indexBuf[48] = {};
+            snprintf(indexBuf, sizeof(indexBuf), "args index [%d] ", static_cast<int>(i));
+            printArgValue(env, typeName, value, indexBuf);
+        }
+        return true;
+    }
+
+    /**
+     * A 变体(Call*MethodA / NewObjectA)的参数打印。
+     * 参数是 jvalue 数组, 完全依赖 GetMethodID 缓存里记下的签名。
+     */
+    static void getArgsInfoFromArray(JNIEnv *env, jobject obj, jmethodID jmethodId,
+                                     const jvalue *args, bool isStatic) {
+        if (env == nullptr || obj == nullptr || jmethodId == nullptr) {
+            return;
+        }
+        if (env->ExceptionCheck()) {
+            return;
+        }
+        CachedMethodInfo cached;
+        if (!lookupMethodInfo(jmethodId, cached)) {
+            write("args  <未记录到 GetMethodID, 无法解析 jvalue 数组  mid=" +
+                  getAddressHex((void *) jmethodId) + ">\n");
+            return;
+        }
+        printArgsFromCache(env, cached,
+                           [args](size_t i, const string &raw, jvalue &v) {
+                               fetchArrayArgValue(args, i, sigToTypeName(raw), v);
+                           });
+    }
+
+    /**
      * 打印被调用的方法信息和全部参数
      *
      * @param args 必须是va_copy出来的副本,因为orig_xxx会把原始的va_list消费掉
@@ -916,6 +1394,19 @@ namespace ZhenxiRunTime::JniTrace {
         if (env->ExceptionCheck()) {
             //有未处理异常时不打印,避免破坏目标程序的状态
             return;
+        }
+        //优路径: GetMethodID 已经记下签名, 直接按签名解析 —— 不往 Java 层反射。
+        //加固 so 的调用链靠这条路径才能拿到 "类名.方法名+签名"。
+        CachedMethodInfo cached;
+        if (lookupMethodInfo(jmethodId, cached)) {
+            va_list walk;
+            va_copy(walk, args);
+            if (printArgsFromCache(env, cached,
+                                   [&walk](size_t, const string &raw, jvalue &v) {
+                                       fetchArgValue(walk, sigToTypeName(raw), v);
+                                   })) {
+                return;
+            }
         }
         //静态方法传进来的obj本身就是jclass,非静态的是实例对象
         jclass declaringClass = nullptr;
@@ -1016,7 +1507,7 @@ namespace ZhenxiRunTime::JniTrace {
         IS_MATCH
             GET_ADDRESS
             write(string("<" + address + ">NewStringUTF : ").append(
-                    bytes == nullptr ? "" : bytes).append("\n"));
+                    escapeCString(bytes, MAX_PRINT_SIZE)).append("\n"));
             return orig_NewStringUTF(env, bytes);
 
         }
@@ -1036,7 +1527,8 @@ namespace ZhenxiRunTime::JniTrace {
                 return chars;
             }
             GET_ADDRESS
-            write(string("<" + address + ">GetStringUTFChars : ").append(chars).append("\n"));
+            write(string("<" + address + ">GetStringUTFChars : ").append(
+                    escapeCString(chars, MAX_PRINT_SIZE)).append("\n"));
             return chars;
 
         }
@@ -1168,6 +1660,77 @@ namespace ZhenxiRunTime::JniTrace {
         return orig_FromReflectedMethod(env, method);
     }
 
+
+    /**
+     * UTF-16(jchar*) 转义视图。
+     * NewString 的入参不以 0 结尾 —— 长度由 len 单独给出, 不能用 escapeCString。
+     */
+    static string escapeJCharString(const jchar *data, jsize len) {
+        if (data == nullptr) {
+            return "null";
+        }
+        string out;
+        out.reserve(64);
+        for (jsize i = 0; i < len && i < 256; ++i) {
+            auto c = static_cast<unsigned int>(data[i]);
+            if (c >= 0x20 && c < 0x7F) {
+                out.push_back(static_cast<char>(c));
+            } else {
+                char buf[16] = {};
+                snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            }
+        }
+        return out;
+    }
+
+    //jmethodID   (*GetMethodID)(JNIEnv*, jclass, const char*, const char*);
+    //
+    // 这个 hook 不只是"多打印一行": 它把 mid -> {类名, 方法名, 签名} 记进缓存,
+    // 后续 Call*MethodV/A 全靠它把一串 mid 地址翻译成可读调用链。
+    // 加固 so 用 JNI 调 Java 时, 日志里原来只有 mid, 根本看不出调的是什么。
+    JNITRACE_HOOK_DEF(jmethodID, GetMethodID, JNIEnv *env, jclass clazz, const char *name,
+                      const char *sig) {
+        DL_INFO
+        IS_MATCH
+            jmethodID ret = orig_GetMethodID(env, clazz, name, sig);
+            if (ret != nullptr) {
+                string classInfo = getJObjectToString(env, clazz);
+                cacheMethodInfo(ret, classInfo, name, sig);
+                GET_ADDRESS
+                write(string("<" + address + ">GetMethodID ").append(classInfo).append(".")
+                              .append(name == nullptr ? "" : name)
+                              .append(sig == nullptr ? "" : sig)
+                              .append(" mid=").append(getAddressHex((void *) ret))
+                              .append("\n"));
+            }
+            return ret;
+
+        }
+        return orig_GetMethodID(env, clazz, name, sig);
+    }
+
+    //jmethodID   (*GetStaticMethodID)(JNIEnv*, jclass, const char*, const char*);
+    JNITRACE_HOOK_DEF(jmethodID, GetStaticMethodID, JNIEnv *env, jclass clazz, const char *name,
+                      const char *sig) {
+        DL_INFO
+        IS_MATCH
+            jmethodID ret = orig_GetStaticMethodID(env, clazz, name, sig);
+            if (ret != nullptr) {
+                string classInfo = getJObjectToString(env, clazz);
+                cacheMethodInfo(ret, classInfo, name, sig);
+                GET_ADDRESS
+                write(string("<" + address + ">GetStaticMethodID ").append(classInfo).append(".")
+                              .append(name == nullptr ? "" : name)
+                              .append(sig == nullptr ? "" : sig)
+                              .append(" mid=").append(getAddressHex((void *) ret))
+                              .append("\n"));
+            }
+            return ret;
+
+        }
+        return orig_GetStaticMethodID(env, clazz, name, sig);
+    }
 
     //jfieldID  (*GetFieldID)(JNIEnv*, jclass, const char*, const char*);
     JNITRACE_HOOK_DEF(jfieldID, GetFieldID, JNIEnv *env, jclass clazz, const char *name,
@@ -1514,6 +2077,159 @@ namespace ZhenxiRunTime::JniTrace {
             return ret;
         }
         return orig_DefineClass(env, name, loader, buf, bufLen);
+    }
+
+    // ============================ 补齐的 hook ============================
+    //
+    // 下面这批是原实现没有覆盖、而加固 so(实测 GameVMP)大量使用的 JNI 入口。
+    // 少了它们调用链在日志里就是断的 —— 比如它只用 GetStaticObjectField 取字段、
+    // 只用 NewObjectArray/GetObjectArrayElement 摆参数, 完全不碰 NewObjectV。
+    //
+    // 实测依据(指令级 trace 把 blr 目标映射到 libart 符号):
+    //   CallStaticObjectMethodA / CallObjectMethodA / NewObjectA / GetMethodID /
+    //   GetStaticMethodID / GetObjectArrayElement / SetObjectArrayElement /
+    //   NewObjectArray / GetStaticFieldID / GetStaticObjectField
+    // 这些在原来的 hook 列表里全部缺失。
+
+    //jstring     (*NewString)(JNIEnv*, const jchar*, jsize);
+    JNITRACE_HOOK_DEF(jstring, NewString, JNIEnv *env, const jchar *unicodeChars, jsize len) {
+        DL_INFO
+        IS_MATCH
+            jstring ret = orig_NewString(env, unicodeChars, len);
+            if (ret != nullptr && unicodeChars != nullptr && len > 0) {
+                GET_ADDRESS
+                write(string("<" + address + ">NewString : ").append(
+                        escapeJCharString(unicodeChars, len)).append("\n"));
+            }
+            return ret;
+        }
+        return orig_NewString(env, unicodeChars, len);
+    }
+
+    //jbyteArray  (*NewByteArray)(JNIEnv*, jsize);
+    JNITRACE_HOOK_DEF(jbyteArray, NewByteArray, JNIEnv *env, jsize length) {
+        DL_INFO
+        IS_MATCH
+            jbyteArray ret = orig_NewByteArray(env, length);
+            if (ret != nullptr) {
+                GET_ADDRESS
+                write(string("<" + address + ">NewByteArray len=").append(
+                        to_string(static_cast<int>(length))).append("\n"));
+            }
+            return ret;
+        }
+        return orig_NewByteArray(env, length);
+    }
+
+    //jsize       (*GetArrayLength)(JNIEnv*, jarray);
+    JNITRACE_HOOK_DEF(jsize, GetArrayLength, JNIEnv *env, jarray array) {
+        DL_INFO
+        IS_MATCH
+            jsize ret = orig_GetArrayLength(env, array);
+            GET_ADDRESS
+            write(string("<" + address + ">GetArrayLength = ").append(
+                    to_string(static_cast<int>(ret))).append("\n"));
+            return ret;
+        }
+        return orig_GetArrayLength(env, array);
+    }
+
+    //jobjectArray (*NewObjectArray)(JNIEnv*, jsize, jclass, jobject);
+    JNITRACE_HOOK_DEF(jobjectArray, NewObjectArray, JNIEnv *env, jsize length, jclass elementClass,
+                      jobject initialElement) {
+        DL_INFO
+        IS_MATCH
+            jobjectArray ret = orig_NewObjectArray(env, length, elementClass, initialElement);
+            GET_ADDRESS
+            write(string("<" + address + ">NewObjectArray len=").append(
+                    to_string(static_cast<int>(length))).append(" elementClass=").append(
+                    getJObjectToString(env, elementClass)).append("\n"));
+            return ret;
+        }
+        return orig_NewObjectArray(env, length, elementClass, initialElement);
+    }
+
+    //jobject     (*GetObjectArrayElement)(JNIEnv*, jobjectArray, jsize);
+    JNITRACE_HOOK_DEF(jobject, GetObjectArrayElement, JNIEnv *env, jobjectArray array,
+                      jsize index) {
+        DL_INFO
+        IS_MATCH
+            jobject ret = orig_GetObjectArrayElement(env, array, index);
+            GET_ADDRESS
+            getJObjectInfoInternal(env, ret,
+                                   "<" + address + ">GetObjectArrayElement index=" +
+                                   to_string(static_cast<int>(index)) + " result object :",
+                                   true, "");
+            return ret;
+        }
+        return orig_GetObjectArrayElement(env, array, index);
+    }
+
+    //void        (*SetObjectArrayElement)(JNIEnv*, jobjectArray, jsize, jobject);
+    JNITRACE_HOOK_DEF(void, SetObjectArrayElement, JNIEnv *env, jobjectArray array, jsize index,
+                      jobject value) {
+        DL_INFO
+        IS_MATCH
+            GET_ADDRESS
+            getJObjectInfoInternal(env, value,
+                                   "<" + address + ">SetObjectArrayElement index=" +
+                                   to_string(static_cast<int>(index)) + " value object :",
+                                   true, "");
+            orig_SetObjectArrayElement(env, array, index, value);
+            return;
+        }
+        orig_SetObjectArrayElement(env, array, index, value);
+    }
+
+    //jclass      (*GetObjectClass)(JNIEnv*, jobject);
+    JNITRACE_HOOK_DEF(jclass, GetObjectClass, JNIEnv *env, jobject obj) {
+        DL_INFO
+        IS_MATCH
+            jclass ret = orig_GetObjectClass(env, obj);
+            if (ret != nullptr) {
+                GET_ADDRESS
+                write(string("<" + address + ">GetObjectClass : ").append(
+                        getJObjectToString(env, ret)).append("\n"));
+            }
+            return ret;
+        }
+        return orig_GetObjectClass(env, obj);
+    }
+
+    //jboolean    (*IsInstanceOf)(JNIEnv*, jobject, jclass);
+    JNITRACE_HOOK_DEF(jboolean, IsInstanceOf, JNIEnv *env, jobject obj, jclass clazz) {
+        DL_INFO
+        IS_MATCH
+            jboolean ret = orig_IsInstanceOf(env, obj, clazz);
+            GET_ADDRESS
+            write(string("<" + address + ">IsInstanceOf = ").append(
+                    ret == JNI_TRUE ? "true" : "false").append("\n"));
+            return ret;
+        }
+        return orig_IsInstanceOf(env, obj, clazz);
+    }
+
+    //jbyte*      (*GetByteArrayElements)(JNIEnv*, jbyteArray, jboolean*);
+    JNITRACE_HOOK_DEF(jbyte*, GetByteArrayElements, JNIEnv *env, jbyteArray array,
+                      jboolean *isCopy) {
+        DL_INFO
+        IS_MATCH
+            jbyte *ret = orig_GetByteArrayElements(env, array, isCopy);
+            if (ret != nullptr && array != nullptr) {
+                jsize len = env->GetArrayLength(array);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                } else if (len > 0) {
+                    const jsize dumped = len < MAX_DUMP_BYTES ? len : MAX_DUMP_BYTES;
+                    GET_ADDRESS
+                    write(string("<" + address + ">GetByteArrayElements [B len=" +
+                                 to_string(static_cast<int>(len)) + "  hex=" +
+                                 bytesToHexView(ret, len, dumped)).append("\n"));
+                }
+            }
+            return ret;
+        }
+        return orig_GetByteArrayElements(env, array, isCopy);
     }
 }
 
