@@ -147,6 +147,23 @@ namespace ZhenxiRunTime::JniTrace {
      */
     static thread_local char match_so_name[MATCH_SO_NAME_SIZE] = {};
 
+    /**
+     * 打印路径重入抑制计数(线程内)。
+     *
+     * 取一个对象的字符串表示需要调用 JNI(GetObjectClass / CallObjectMethod / GetMethodID...),
+     * 而这些函数本身也被 hook 了 —— 一旦它们又把控制权交回打印路径就是无限递归。
+     * 之前 GetObjectClass/GetMethodID/GetArrayLength 没被 hook 时这个隐患不明显,
+     * 补上以后必须显式挡住: 打印期间发出的 JNI 调用一律不记录,
+     * 那些调用本来也只是打印基础设施自己的动作, 不是目标程序的业务调用。
+     */
+    static thread_local int gPrintDepth = 0;
+
+    struct PrintGuard {
+        PrintGuard() { ++gPrintDepth; }
+
+        ~PrintGuard() { --gPrintDepth; }
+    };
+
 # define DL_INFO \
     Dl_info info={nullptr}; \
     int addr_ret_0= dladdr((void *) __builtin_return_address(0), &info); \
@@ -170,6 +187,10 @@ namespace ZhenxiRunTime::JniTrace {
 
     static bool isLister(int dladd_ret, Dl_info *info) {
         if (dladd_ret == 0) {
+            return false;
+        }
+        //打印路径自己发出的 JNI 调用不记录, 否则 GetObjectClass/GetMethodID 会递归打印自己
+        if (gPrintDepth > 0) {
             return false;
         }
         if (info == nullptr) {
@@ -976,6 +997,10 @@ namespace ZhenxiRunTime::JniTrace {
         if (env == nullptr || obj == nullptr) {
             return "null";
         }
+        //打印期间调用的 JNI 一律不记录(详见 gPrintDepth 注释)。
+        //这里是递归链的关键节点: GetMethodID/GetObjectClass/NewObjectArray 的 hook
+        //会直接调它, 而它内部又要用 GetObjectClass —— 不挡就是无限递归。
+        PrintGuard guard;
         jclass objectClazz = env->FindClass("java/lang/Object");
         if (objectClazz == nullptr) {
             if (env->ExceptionCheck()) {
@@ -1194,6 +1219,7 @@ namespace ZhenxiRunTime::JniTrace {
             env->ExceptionClear();
             return;
         }
+        PrintGuard guard;
         //原实现把临时std::string的c_str()存了下来,出作用域后就是悬垂指针,这里按值传递
         string info = classInfo.empty() ? getObjectClassName(env, obj) : classInfo;
         string text = describeJObject(env, obj, info);
@@ -1369,8 +1395,10 @@ namespace ZhenxiRunTime::JniTrace {
         if (env->ExceptionCheck()) {
             return;
         }
+        PrintGuard guard;
         CachedMethodInfo cached;
         if (!lookupMethodInfo(jmethodId, cached)) {
+            (void) isStatic;
             write("args  <未记录到 GetMethodID, 无法解析 jvalue 数组  mid=" +
                   getAddressHex((void *) jmethodId) + ">\n");
             return;
@@ -1395,6 +1423,7 @@ namespace ZhenxiRunTime::JniTrace {
             //有未处理异常时不打印,避免破坏目标程序的状态
             return;
         }
+        PrintGuard guard;
         //优路径: GetMethodID 已经记下签名, 直接按签名解析 —— 不往 Java 层反射。
         //加固 so 的调用链靠这条路径才能拿到 "类名.方法名+签名"。
         CachedMethodInfo cached;
@@ -2216,6 +2245,7 @@ namespace ZhenxiRunTime::JniTrace {
         IS_MATCH
             jbyte *ret = orig_GetByteArrayElements(env, array, isCopy);
             if (ret != nullptr && array != nullptr) {
+                PrintGuard guard;
                 jsize len = env->GetArrayLength(array);
                 if (env->ExceptionCheck()) {
                     env->ExceptionClear();
@@ -2248,6 +2278,15 @@ void Jnitrace::init(JNIEnv *env) {
     HOOK_JNITRACE(env, CallDoubleMethodV)
     HOOK_JNITRACE(env, CallVoidMethodV)
 
+    //A 变体: 参数是 jvalue 数组。
+    //加固后的 so 几乎只用这一组 —— 它自己拿 mid 直接把参数拼成 jvalue 再一次性传进来,
+    //不需要构造 va_list。原来只 hook 了 V 变体, 于是这类调用在日志里完全空白。
+    HOOK_JNITRACE(env, CallObjectMethodA)
+    HOOK_JNITRACE(env, CallBooleanMethodA)
+    HOOK_JNITRACE(env, CallIntMethodA)
+    HOOK_JNITRACE(env, CallLongMethodA)
+    HOOK_JNITRACE(env, CallVoidMethodA)
+
     HOOK_JNITRACE(env, CallStaticObjectMethodV)
     HOOK_JNITRACE(env, CallStaticBooleanMethodV)
     HOOK_JNITRACE(env, CallStaticByteMethodV)
@@ -2258,6 +2297,12 @@ void Jnitrace::init(JNIEnv *env) {
     HOOK_JNITRACE(env, CallStaticFloatMethodV)
     HOOK_JNITRACE(env, CallStaticDoubleMethodV)
     HOOK_JNITRACE(env, CallStaticVoidMethodV)
+
+    HOOK_JNITRACE(env, CallStaticObjectMethodA)
+    HOOK_JNITRACE(env, CallStaticBooleanMethodA)
+    HOOK_JNITRACE(env, CallStaticIntMethodA)
+    HOOK_JNITRACE(env, CallStaticLongMethodA)
+    HOOK_JNITRACE(env, CallStaticVoidMethodA)
 
 
     HOOK_JNITRACE(env, GetObjectField)
@@ -2293,7 +2338,13 @@ void Jnitrace::init(JNIEnv *env) {
     HOOK_JNITRACE(env, GetFieldID)
     HOOK_JNITRACE(env, GetStaticFieldID)
 
+    //获取方法ID —— 必须 hook: 它同时把 mid -> {类名, 方法名, 签名} 写进缓存,
+    //后面 Call*Method 的日志靠这个缓存才能把裸 mid 翻译成可读调用链。
+    HOOK_JNITRACE(env, GetMethodID)
+    HOOK_JNITRACE(env, GetStaticMethodID)
+
     HOOK_JNITRACE(env, NewObjectV)
+    HOOK_JNITRACE(env, NewObjectA)
 
     //将C数组中的数据复制到Java字节数组
     HOOK_JNITRACE(env, SetByteArrayRegion)
@@ -2302,6 +2353,20 @@ void Jnitrace::init(JNIEnv *env) {
     //从Java字符串中获取指定范围的字符
     HOOK_JNITRACE(env, GetStringRegion)
     HOOK_JNITRACE(env, GetStringUTFRegion)
+
+    //数组与对象基础操作
+    //加固 so 根本不碰 NewString(UTF-16 版), 字符串全走 NewStringUTF;
+    //但它大量用 NewByteArray/NewObjectArray/GetObjectArrayElement 摆参数,
+    //少了这些就像看一段没有参数列表的调用链。
+    HOOK_JNITRACE(env, NewString)
+    HOOK_JNITRACE(env, NewByteArray)
+    HOOK_JNITRACE(env, NewObjectArray)
+    HOOK_JNITRACE(env, GetArrayLength)
+    HOOK_JNITRACE(env, GetObjectArrayElement)
+    HOOK_JNITRACE(env, SetObjectArrayElement)
+    HOOK_JNITRACE(env, GetByteArrayElements)
+    HOOK_JNITRACE(env, GetObjectClass)
+    HOOK_JNITRACE(env, IsInstanceOf)
 
 
     LOG(INFO) << ">>>>>>>>> Jnitrace hook success! ";
