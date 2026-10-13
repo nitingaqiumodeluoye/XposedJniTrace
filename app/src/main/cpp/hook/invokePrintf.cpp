@@ -26,6 +26,7 @@
 //   4. 文件写入统一走 TraceLog 的锁(和 Jnitrace / stringHandler 共用同一把锁)。
 //
 #include <atomic>
+#include <sstream>
 
 #include "../includes/invokePrintf.h"
 
@@ -122,8 +123,16 @@ static void printRegisterNative(void *art_method, const void *native_method) {
                           reinterpret_cast<size_t>(info.dli_fbase);
         libName = info.dli_fname;
     }
+    //地址也必须进文件:显式注册的方法在 so 里没有静态符号,
+    //错过这次输出(比如 logcat 被 hunter 那种日志洪水冲掉)就再也拿不到地址了。
+    //实测:124 条 libhunter.so 注册记录里,只靠 logcat 能读到 0 条。
     if (isSave.load()) {
-        writeInvokeLog(basicString + "\n");
+        std::ostringstream line;
+        line << "REGISTER_NATIVE " << basicString
+             << " absolute address(内存地址) -> " << native_method
+             << "  relative offset(相对地址) " << (void *) relative_offset
+             << " 所属ELF文件 [" << getFileNameForPath(libName) << "]\n";
+        writeInvokeLog(line.str());
     }
     LOG(INFO) << "REGISTER_NATIVE " << basicString.c_str()
               << " absolute address(内存地址) -> " << native_method
