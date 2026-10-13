@@ -30,6 +30,15 @@ namespace ZhenxiRunTime::JniTrace {
     static void
     getArgsInfo(JNIEnv *env, jobject obj, jmethodID jmethodId, va_list args, bool isStatic);
 
+    /**
+     * A 变体(Call*MethodA / NewObjectA)的参数打印。
+     * 必须在这里先声明: A 变体 hook 写在文件前部, 而它的实现依赖一堆后置的辅助函数
+     * (mid 缓存 / 签名解析 / printArgValue), 放到后面定义就只能前置声明。
+     */
+    static void
+getArgsInfoFromArray(JNIEnv *env, jobject obj, jmethodID jmethodId, const jvalue *args,
+                      bool isStatic);
+
     static void getJObjectInfo(JNIEnv *env, jobject obj, const string &methodname);
 
     static string getJObjectToString(JNIEnv *env, jobject obj);
