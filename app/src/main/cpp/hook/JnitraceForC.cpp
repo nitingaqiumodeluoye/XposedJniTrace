@@ -913,7 +913,12 @@ namespace ZhenxiRunTime::JniTrace {
 
     /**
      * 按AArch64的va_list布局(struct __va_list{stack,gr_top,vr_top,gr_offs,vr_offs})
-     * 直接把结构体字段和GR槽位打出来,用于定位"参数读错位"。
+     * 把结构体字段、完整RSE(x0..x7)、按定位走到的槽位、以及真正用va_arg读到的值
+     * 全部写在**同一行**里。
+     *
+     * 同一行才能自洽地对比:walk(手算grTop+grOffs+8k)和va(va_arg按ABI取)
+     * 如果不一致,说明我们对va_list的理解/取值姿势和编译器不一致;
+     * 如果一致但仍与真实参数不符,说明拿到的va_list本身就不对。
      */
     static void dumpVaListForDebug(va_list args, jint paramCount) {
         if (!isDebugDump()) {
@@ -928,20 +933,51 @@ namespace ZhenxiRunTime::JniTrace {
         };
         VaListLayout vl{};
         memcpy(&vl, &args, sizeof(vl));
-        char buf[256] = {};
-        int n = snprintf(buf, sizeof(buf),
-                         "DBG valist=%p sizeof=%zu stk=%p grTop=%p vrTop=%p grOffs=%d vrOffs=%d paramCount=%d\n",
-                         (void *) &args, sizeof(va_list), vl.stk, vl.grTop, vl.vrTop, vl.grOffs, vl.vrOffs,
-                         static_cast<int>(paramCount));
-        write(string(buf, static_cast<size_t>(n)));
+        char buf[64] = {};
+        string out = "DBG sizeof=" + std::to_string(sizeof(va_list)) +
+                     " self=" + getAddressHex(&args) + " stk=" + getAddressHex(vl.stk) +
+                     " grTop=" + getAddressHex(vl.grTop) + " vrTop=" + getAddressHex(vl.vrTop) +
+                     " grOffs=" + std::to_string(vl.grOffs) +
+                     " vrOffs=" + std::to_string(vl.vrOffs) +
+                     " n=" + std::to_string(static_cast<int>(paramCount));
+        out += " rse(x0..x7)=[";
         for (int k = 0; k < 8; k++) {
-            void *slot = nullptr;
+            void *p = nullptr;
             if (vl.grTop != nullptr) {
-                memcpy(&slot, reinterpret_cast<char *>(vl.grTop) + vl.grOffs + k * 8, sizeof(slot));
+                memcpy(&p, reinterpret_cast<char *>(vl.grTop) - 64 + k * 8, sizeof(p));
             }
-            n = snprintf(buf, sizeof(buf), "DBG gr[%d] = %p\n", k, slot);
-            write(string(buf, static_cast<size_t>(n)));
+            snprintf(buf, sizeof(buf), "%s%p", k == 0 ? "" : " ", p);
+            out += buf;
         }
+        out += "] walk=[";
+        for (int k = 0; k < 8; k++) {
+            void *p = nullptr;
+            if (vl.grTop != nullptr) {
+                memcpy(&p, reinterpret_cast<char *>(vl.grTop) + vl.grOffs + k * 8, sizeof(p));
+            }
+            snprintf(buf, sizeof(buf), "%s%p", k == 0 ? "" : " ", p);
+            out += buf;
+        }
+        out += "] va=[";
+        va_list copy;
+        va_copy(copy, args);
+        for (int k = 0; k < paramCount && k < 8; k++) {
+            void *p = va_arg(copy, void *);
+            snprintf(buf, sizeof(buf), "%s%p", k == 0 ? "" : " ", p);
+            out += buf;
+        }
+        va_end(copy);
+        out += "] stk=[";
+        for (int k = 0; k < 4; k++) {
+            void *p = nullptr;
+            if (vl.stk != nullptr) {
+                memcpy(&p, reinterpret_cast<char *>(vl.stk) + k * 8, sizeof(p));
+            }
+            snprintf(buf, sizeof(buf), "%s%p", k == 0 ? "" : " ", p);
+            out += buf;
+        }
+        out += "]\n";
+        write(out);
     }
 
     /**
