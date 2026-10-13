@@ -897,6 +897,54 @@ namespace ZhenxiRunTime::JniTrace {
     }
 
     /**
+     * 临时诊断开关:存在 /data/local/tmp/funjni_dbg 时,把收到的va_list原样dump出来。
+     */
+    static bool isDebugDump() {
+        static const bool enabled = [] {
+            FILE *f = fopen("/data/local/tmp/funjni_dbg", "r");
+            if (f == nullptr) {
+                return false;
+            }
+            fclose(f);
+            return true;
+        }();
+        return enabled;
+    }
+
+    /**
+     * 按AArch64的va_list布局(struct __va_list{stack,gr_top,vr_top,gr_offs,vr_offs})
+     * 直接把结构体字段和GR槽位打出来,用于定位"参数读错位"。
+     */
+    static void dumpVaListForDebug(va_list args, jint paramCount) {
+        if (!isDebugDump()) {
+            return;
+        }
+        struct VaListLayout {
+            void *stk;
+            void *grTop;
+            void *vrTop;
+            int grOffs;
+            int vrOffs;
+        };
+        VaListLayout vl{};
+        memcpy(&vl, &args, sizeof(vl));
+        char buf[256] = {};
+        int n = snprintf(buf, sizeof(buf),
+                         "DBG valist=%p sizeof=%zu stk=%p grTop=%p vrTop=%p grOffs=%d vrOffs=%d paramCount=%d\n",
+                         (void *) &args, sizeof(va_list), vl.stk, vl.grTop, vl.vrTop, vl.grOffs, vl.vrOffs,
+                         static_cast<int>(paramCount));
+        write(string(buf, static_cast<size_t>(n)));
+        for (int k = 0; k < 8; k++) {
+            void *slot = nullptr;
+            if (vl.grTop != nullptr) {
+                memcpy(&slot, reinterpret_cast<char *>(vl.grTop) + vl.grOffs + k * 8, sizeof(slot));
+            }
+            n = snprintf(buf, sizeof(buf), "DBG gr[%d] = %p\n", k, slot);
+            write(string(buf, static_cast<size_t>(n)));
+        }
+    }
+
+    /**
      * 打印被调用的方法信息和全部参数
      *
      * @param args 必须是va_copy出来的副本,因为orig_xxx会把原始的va_list消费掉
@@ -968,6 +1016,7 @@ namespace ZhenxiRunTime::JniTrace {
             env->DeleteLocalRef(invokeMethod);
             return;
         }
+        dumpVaListForDebug(args, paramCount);
         auto types = (jobjectArray) env->CallObjectMethod(invokeMethod, typesId);
         env->DeleteLocalRef(methodClazz);
         env->DeleteLocalRef(invokeMethod);
