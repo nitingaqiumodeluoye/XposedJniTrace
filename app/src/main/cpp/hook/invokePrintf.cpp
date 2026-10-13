@@ -2,8 +2,18 @@
 // Created by zhenxi on 2022/2/6.
 //
 // Two 个 ART 层 hook:
-//   - art::ArtMethod::Invoke        打印所有 Java 方法调用(function id "4")
-//   - art::ArtMethod::RegisterNative 打印静态注册的 native 方法与实现地址(function id "2")
+//   - art::ArtMethod::Invoke         打印所有 Java 方法调用(function id "4")
+//   - native 注册入口(见 HookJNIRegisterNative) 打印 native 方法的注册信息(function id "2")
+//
+// 关于 function id "2" 的一个常见误解(原注释写的是"静态注册",正好说反了):
+//   它只能看到**显式注册**——Java 层调 env->RegisterNatives() 的那种;
+//   看不到"静态注册"(so 里导出 Java_pkg_Class_method,靠命名约定匹配):
+//   后者在 ART 里走 ClassLinker::LinkCode 里设置的 dlsym lookup stub 懒解析,
+//   根本不经过 RegisterNative。
+//   所以对纯静态注册的 so 这个功能没有输出,要观察它们请用 function id "0"/"3"。
+//
+// 另外 RegisterNative 的符号位置在 ART 里搬过家(ArtMethod -> ClassLinker),
+// 改动前只认老符号,在新系统上会"符号找不到、功能静默失效"。
 //
 // 注意:
 //   1. hook 走 Vector 下发的 wxshadow(见 HookUtils / VectorNativeApi),不再用 Dobby;
@@ -93,13 +103,17 @@ void invokePrintf::HookJNIInvoke(JNIEnv *env,
     LOGE(">>>>>>>>> hook art method invoke success ! %s ", isSuccess ? "true" : "false")
 }
 
-HOOK_DEF(void*, RegisterNative, void *thiz, void *native_method) {
-    string basicString = invokePrintf_org_PrettyMethodSym != nullptr
-                         ? invokePrintf_org_PrettyMethodSym(thiz, true)
-                         : string();
-    if (isSave.load()) {
-        writeInvokeLog(basicString.append("\n"));
-    }
+/**
+ * 打印一次 native 方法注册。
+ *
+ * @param art_method    ArtMethod*(PrettyMethod 需要它拿方法签名)
+ * @param native_method native 实现地址
+ */
+static void printRegisterNative(void *art_method, const void *native_method) {
+    string basicString =
+            (invokePrintf_org_PrettyMethodSym != nullptr && art_method != nullptr)
+            ? invokePrintf_org_PrettyMethodSym(art_method, true)
+            : string();
     Dl_info info{nullptr};
     const char *libName = nullptr;
     size_t relative_offset = 0;
@@ -108,12 +122,38 @@ HOOK_DEF(void*, RegisterNative, void *thiz, void *native_method) {
                           reinterpret_cast<size_t>(info.dli_fbase);
         libName = info.dli_fname;
     }
+    if (isSave.load()) {
+        writeInvokeLog(basicString + "\n");
+    }
     LOG(INFO) << "REGISTER_NATIVE " << basicString.c_str()
               << " absolute address(内存地址) -> " << native_method
               << "  relative offset(相对地址) " << (void *) relative_offset
               << " 所属ELF文件 [" << getFileNameForPath(libName) << "]";
+}
 
-    return orig_RegisterNative(thiz, native_method);
+/**
+ * Android 5-7: art::ArtMethod::RegisterNative(const void* native_method)
+ * this 是 ArtMethod*,实现地址就是第一个显式参数。
+ */
+HOOK_DEF(void, RegisterNativeArtMethod, void *thiz, void *native_method) {
+    printRegisterNative(thiz, native_method);
+    if (orig_RegisterNativeArtMethod != nullptr) {
+        orig_RegisterNativeArtMethod(thiz, native_method);
+    }
+}
+
+/**
+ * Android 8+: art::ClassLinker::RegisterNative(Thread* self,
+ *                                              ArtMethod* method,
+ *                                              const void* native_method)
+ * this 是 ClassLinker*,ArtMethod 和实现地址都是显式参数。
+ */
+HOOK_DEF(void, RegisterNativeClassLinker, void *thiz, void *self, void *method,
+         void *native_method) {
+    printRegisterNative(method, native_method);
+    if (orig_RegisterNativeClassLinker != nullptr) {
+        orig_RegisterNativeClassLinker(thiz, self, method, native_method);
+    }
 }
 
 void invokePrintf::HookJNIRegisterNative(JNIEnv *env,
@@ -126,16 +166,38 @@ void invokePrintf::HookJNIRegisterNative(JNIEnv *env,
     if (invokePrintf_org_PrettyMethodSym == nullptr) {
         invokePrintf_org_PrettyMethodSym = prettyMethodSym;
     }
-    //artmethod->RegisterNative
-    void *registerNativeSym =
-            getSymCompat(getlibArtPath(),
-                         "_ZN3art9ArtMethod14RegisterNativeEPKv");
-    if (registerNativeSym == nullptr) {
-        LOGE(">>>>>>>>> hook art method RegisterNative fail ")
+    const char *artPath = getlibArtPath();
+    if (artPath == nullptr) {
+        LOGE(">>>>>>>>> hook RegisterNative fail : cannot locate libart")
         return;
     }
-    bool isSuccess = HookUtils::Hooker(registerNativeSym,
-                                       (void *) new_RegisterNative,
-                                       (void **) &orig_RegisterNative);
-    LOGE(">>>>>>>>> hook art method register native success ! %s ", isSuccess ? "true" : "false")
+    //RegisterNative 的符号在不同 ART 版本里位置不同,按新->旧顺序尝试:
+    //  Android 8+ : art::ClassLinker::RegisterNative(Thread*, ArtMethod*, const void*)
+    //  Android 5-7: art::ArtMethod::RegisterNative(const void*)
+    struct Candidate {
+        const char *symbol;
+        void *replacement;
+        void **backup;
+    };
+    const Candidate candidates[] = {
+            {"_ZN3art11ClassLinker14RegisterNativeEPNS_6ThreadEPNS_9ArtMethodEPKv",
+             reinterpret_cast<void *>(new_RegisterNativeClassLinker),
+             reinterpret_cast<void **>(&orig_RegisterNativeClassLinker)},
+            {"_ZN3art9ArtMethod14RegisterNativeEPKv",
+             reinterpret_cast<void *>(new_RegisterNativeArtMethod),
+             reinterpret_cast<void **>(&orig_RegisterNativeArtMethod)},
+    };
+    for (const Candidate &candidate: candidates) {
+        void *registerNativeSym = getSymCompat(artPath, candidate.symbol);
+        if (registerNativeSym == nullptr) {
+            LOG(INFO) << "RegisterNative symbol not found, try next -> " << candidate.symbol;
+            continue;
+        }
+        if (HookUtils::Hooker(registerNativeSym, candidate.replacement, candidate.backup)) {
+            LOG(INFO) << ">>>>>>>>> hook RegisterNative success -> " << candidate.symbol;
+            return;
+        }
+        LOGE(">>>>>>>>> hook RegisterNative failed -> %s", candidate.symbol)
+    }
+    LOGE(">>>>>>>>> hook RegisterNative fail : no usable symbol in libart")
 }
