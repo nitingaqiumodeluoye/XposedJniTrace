@@ -2472,27 +2472,21 @@ getArgsInfoFromArray(JNIEnv *env, jobject obj, jmethodID jmethodId, const jvalue
 
     //void*       (*GetPrimitiveArrayCritical)(JNIEnv*, jarray, jboolean*);
     //
-    // 加固 so 读写大数组时常用 Critical 版(不拷贝, 直接拿堆内指针)。
-    // 元素类型未知, 所以这里只记数组类型与长度 —— 但对应 Set/Get<Type>ArrayRegion 的日志
-    // 往往紧跟在后面, 两边对起来就能定位实际数据。
+    // Critical 区间有硬约束: 从 GetPrimitiveArrayCritical 返回到 ReleasePrimitiveArrayCritical
+    // 之间, 除少数几个函数外**禁止调用任何 JNI**(包括 GetArrayLength / GetObjectClass)。
+    // 在 hook 里调它们看似无害, 实际会让目标程序在 GC 或类准备阶段直接卡死/崩。
+    // 所以这里只记录两个裸指针和 isCopy, 不碰任何 JNI;
+    // 想知道它是哪个数组、多长, 看紧跟在后面的 Set/Get<Type>ArrayRegion 或 New<Type>Array 日志。
     JNITRACE_HOOK_DEF(void*, GetPrimitiveArrayCritical, JNIEnv *env, jarray array,
                       jboolean *isCopy) {
         DL_INFO
         IS_MATCH
             void *ret = orig_GetPrimitiveArrayCritical(env, array, isCopy);
-            if (ret != nullptr && array != nullptr) {
-                PrintGuard guard;
-                jsize len = env->GetArrayLength(array);
-                if (env->ExceptionCheck()) {
-                    env->ExceptionClear();
-                } else {
-                    // 变量名不能叫 info: GET_ADDRESS 宏展开时要用 DL_INFO 里的 info.dli_fbase,
-                    // 同名局部变量会把它遮蔽掉(编译期报 "no member named 'dli_fbase'")
-                    const string arrayInfo = getObjectClassName(env, array);
-                    GET_ADDRESS
-                    write(string("<") + address + ">GetPrimitiveArrayCritical [" + arrayInfo +
-                          "] len=" + to_string(static_cast<int>(len)) + "\n");
-                }
+            if (ret != nullptr) {
+                GET_ADDRESS
+                write(string("<") + address + ">GetPrimitiveArrayCritical array=" +
+                      getAddressHex(array) + " buf=" + getAddressHex(ret) + " isCopy=" +
+                      (isCopy == nullptr ? "?" : (isCopy[0] ? "true" : "false")) + "\n");
             }
             return ret;
         }
@@ -2505,7 +2499,8 @@ getArgsInfoFromArray(JNIEnv *env, jobject obj, jmethodID jmethodId, const jvalue
         DL_INFO
         IS_MATCH
             GET_ADDRESS
-            write(string("<") + address + ">ReleasePrimitiveArrayCritical mode=" +
+            write(string("<") + address + ">ReleasePrimitiveArrayCritical array=" +
+                  getAddressHex(array) + " buf=" + getAddressHex(carray) + " mode=" +
                   to_string(static_cast<int>(mode)) + "\n");
             orig_ReleasePrimitiveArrayCritical(env, array, carray, mode);
             return;
@@ -2514,14 +2509,16 @@ getArgsInfoFromArray(JNIEnv *env, jobject obj, jmethodID jmethodId, const jvalue
     }
 
     //jint        (*Throw)(JNIEnv*, jthrowable);
+    //
+    // 必须在 orig_Throw 之前打印: Throw 返回后异常已挂起,
+    // 此时除少数几个函数外再调 JNI(GetObjectClass/CallObjectMethod...) 是未定义行为。
     JNITRACE_HOOK_DEF(jint, Throw, JNIEnv *env, jthrowable obj) {
         DL_INFO
         IS_MATCH
-            const jint ret = orig_Throw(env, obj);
             GET_ADDRESS
             getJObjectInfoInternal(env, obj,
                                    string("<") + address + ">Throw exception object :", true, "");
-            return ret;
+            return orig_Throw(env, obj);
         }
         return orig_Throw(env, obj);
     }
@@ -2529,14 +2526,14 @@ getArgsInfoFromArray(JNIEnv *env, jobject obj, jmethodID jmethodId, const jvalue
     //jint        (*ThrowNew)(JNIEnv*, jclass, const char*);
     //
     // 校验失败/反调试命中时通常靠抛异常改变控制流, 这条日志是这类分支最直接的证据。
+    // 与 Throw 同理, 打印必须发生在异常挂起之前。
     JNITRACE_HOOK_DEF(jint, ThrowNew, JNIEnv *env, jclass clazz, const char *message) {
         DL_INFO
         IS_MATCH
-            const jint ret = orig_ThrowNew(env, clazz, message);
             GET_ADDRESS
             write(string("<") + address + ">ThrowNew [" + getJObjectToString(env, clazz) +
                   "] " + escapeCString(message, MAX_PRINT_SIZE) + "\n");
-            return ret;
+            return orig_ThrowNew(env, clazz, message);
         }
         return orig_ThrowNew(env, clazz, message);
     }
@@ -2554,14 +2551,17 @@ getArgsInfoFromArray(JNIEnv *env, jobject obj, jmethodID jmethodId, const jvalue
     }
 
     //jint        (*MonitorEnter)(JNIEnv*, jobject);
+    //
+    // 在 orig 之前打印: 若在后面调 toString, 而该对象的 toString 恰好又需要这把锁,
+    // 就会自锁(MonitorEnter 成功后同一线程重入可重入锁不至于死等,
+    // 但其他线程持锁时打印会隐式延长锁的语义, 干脆统一成进锁前打印)。
     JNITRACE_HOOK_DEF(jint, MonitorEnter, JNIEnv *env, jobject obj) {
         DL_INFO
         IS_MATCH
-            const jint ret = orig_MonitorEnter(env, obj);
             GET_ADDRESS
             getJObjectInfoInternal(env, obj,
                                    string("<") + address + ">MonitorEnter object :", true, "");
-            return ret;
+            return orig_MonitorEnter(env, obj);
         }
         return orig_MonitorEnter(env, obj);
     }
@@ -2570,11 +2570,10 @@ getArgsInfoFromArray(JNIEnv *env, jobject obj, jmethodID jmethodId, const jvalue
     JNITRACE_HOOK_DEF(jint, MonitorExit, JNIEnv *env, jobject obj) {
         DL_INFO
         IS_MATCH
-            const jint ret = orig_MonitorExit(env, obj);
             GET_ADDRESS
             getJObjectInfoInternal(env, obj,
                                    string("<") + address + ">MonitorExit object :", true, "");
-            return ret;
+            return orig_MonitorExit(env, obj);
         }
         return orig_MonitorExit(env, obj);
     }
