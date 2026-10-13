@@ -185,6 +185,33 @@ nativeLib/src/main/cpp/      native 基础库(被 app 的 CMake add_subdirectory
     参数全部重复成第一个值，更严重的是把整数当 `jobject` 交给 ART，
     `Thread::DecodeJObject` 解引用未映射地址直接 SIGSEGV(实测 hunter、localsend 秒崩)。
     现在 `fetchArgValue` 改收 `va_list&`，`getArgsInfo` 内部显式 `va_copy` 一份走查。
+18. **`byte[]` 打印把字节烧掉了**：原实现拿 `new String(bytes, "UTF-8")` 再转 `std::string`，
+    二进制里非法 UTF-8 的字节会被解码成 `U+FFFD` 替换符——签名/密文/协议帧这类数据
+    **记下来就是乱的，而且不可还原**（这是数据丢失，不是显示问题）。
+    `NewStringUTF`/`GetStringUTFChars` 直接 `append(bytes)` 同理。
+    现在 `[B` 一律输出 `hex + ascii` 两列，C 字符串按 `\xNN` 转义，
+    全程不做字符集解码，原始字节可逆。
+19. **hook 覆盖不齐：只挂了 V 变体、没有 A 变体**。A 变体(`Call*MethodA`/`NewObjectA`)
+    的参数是一段连续 `jvalue` 数组，加固 so 普遍用它（不需要构造 `va_list`）——
+    实测 GameVMP 调 Java 几乎全走 A 变体，原版日志里这些调用**完全空白**。
+    现已补齐：A 变体全系、`NewObjectA`、`NewString`(UTF-16)、`New*Array` 全族、
+    `Get/Set<Type>ArrayRegion` 全族、`GetObjectArrayElement`/`SetObjectArrayElement`/
+    `NewObjectArray`/`GetArrayLength`/`GetObjectClass`/`IsInstanceOf`/
+    `GetByteArrayElements`、`GetStringChars`/`GetStringLength`、
+    `GetPrimitiveArrayCritical`/`ReleasePrimitiveArrayCritical`、
+    `Throw`/`ThrowNew`/`ExceptionDescribe`、`MonitorEnter`/`MonitorExit`、`GetVersion`。
+20. **没有 `GetMethodID` 就没有方法名**：日志里只有裸 `jmethodID` 地址，
+    看不出调的是谁（也就无法解释 A 变体那段 `jvalue` 数组——签名是唯一线索）。
+    现在 `GetMethodID`/`GetStaticMethodID` 建 `mid -> {类名,方法名,签名}` 缓存，
+    `Call*Method` 命中缓存时直接按签名解析参数，不再往 Java 层反射：
+    既快，也不会因反射再触发一堆 JNI 调用把日志抄脏。
+21. **新 hook 会让打印路径递归自己**：取对象字符串表示本身就要调
+    `GetObjectClass`/`GetMethodID`/`CallObjectMethod`/`GetArrayLength`——
+    这些也在被 hook 的列表里。现在打印期间用一个 `thread_local` 重入计数挡住，
+    递归链上的调用不再记录。
+22. **`RegisterNatives` 没打**：加固 so 不让 Java 调 native，而是自己在 `JNI_OnLoad`
+    里注册。这条日志直接给出 “Java 类 → 方法名+签名 → native 地址”，
+    是反向定位加固 so 真实入口最快的途径（比扫匿名 mapping 猜哪段是解密后的代码靠谱）。
 
 ---
 

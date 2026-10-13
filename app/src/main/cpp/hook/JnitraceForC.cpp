@@ -2270,6 +2270,324 @@ getArgsInfoFromArray(JNIEnv *env, jobject obj, jmethodID jmethodId, const jvalue
         }
         return orig_GetByteArrayElements(env, array, isCopy);
     }
+
+    // ============================ 数组 / 字符串 / 异常 等补齐 ============================
+    //
+    // 原实现只有 byte[] 一条路径, 而加固 so 摆参数时会用各种基本类型数组:
+    // int[] 装索引、Object[] 装可变参数、String[] 装请求头……
+    // 缺了这些, 日志里就只剩一个 "传了个数组" 的空壳。
+
+    /**
+     * 数组 region 的公共打印。
+     *
+     * 按原始字节 dump: 数组内容常常是二进制(密文/协议帧/序列化结构),
+     * 按数值渲染既看不出一致性, 又会把明显的前缀特征冲散。
+     * hex 视图是纯 ASCII, 能完整穿过日志层。
+     */
+    static void printArrayRegion(const char *kind, const string &address, const char *typeName,
+                                 const void *buf, jsize start, jsize len, size_t elemSize) {
+        const string head = string("<") + address + ">" + kind + " " + typeName +
+                            " start=" + to_string(static_cast<int>(start)) +
+                            " len=" + to_string(static_cast<int>(len));
+        if (buf == nullptr || len <= 0) {
+            write(head + " buf=null\n");
+            return;
+        }
+        const size_t total = static_cast<size_t>(len) * elemSize;
+        const jsize totalBytes = total > 0x7FFFFFFF ? 0x7FFFFFFF : static_cast<jsize>(total);
+        const jsize dumped = totalBytes < MAX_DUMP_BYTES ? totalBytes : MAX_DUMP_BYTES;
+        write(head + "  hex=" + bytesToHexView(static_cast<const jbyte *>(buf), totalBytes,
+                                               dumped) + "\n");
+    }
+
+    /**
+     * 批量生成 Get/Set<Type>ArrayRegion 的 hook。
+     *
+     * 这一族有 14 个函数(7 种类型 × Get/Set), 逻辑完全一样。
+     * 逐个手写既啰嗦, 又容易在“数组类型 / 元素类型”这两个名字上抄错 —— 参数化生成更可靠。
+     *
+     * Get 版在 orig 之后打印(打印的是刚读出来的内容), Set 版打印的是即将写入的内容,
+     * 两者都用同一个 buf 视图, 所以可以共用一段实现。
+     */
+#define JNI_ARRAY_REGION_HOOK(func, arrType, elemType, typeName)                           \
+    JNITRACE_HOOK_DEF(void, func, JNIEnv *env, arrType array, jsize start, jsize len,      \
+                      elemType *buf) {                                                     \
+        DL_INFO                                                                            \
+        IS_MATCH                                                                           \
+            orig_##func(env, array, start, len, buf);                                      \
+            GET_ADDRESS                                                                    \
+            printArrayRegion(#func, address, typeName, buf, start, len, sizeof(elemType)); \
+            return;                                                                        \
+        }                                                                                  \
+        orig_##func(env, array, start, len, buf);                                          \
+    }
+
+    JNI_ARRAY_REGION_HOOK(GetBooleanArrayRegion, jbooleanArray, jboolean, "boolean[]")
+    JNI_ARRAY_REGION_HOOK(GetCharArrayRegion, jcharArray, jchar, "char[]")
+    JNI_ARRAY_REGION_HOOK(GetShortArrayRegion, jshortArray, jshort, "short[]")
+    JNI_ARRAY_REGION_HOOK(GetIntArrayRegion, jintArray, jint, "int[]")
+    JNI_ARRAY_REGION_HOOK(GetLongArrayRegion, jlongArray, jlong, "long[]")
+    JNI_ARRAY_REGION_HOOK(GetFloatArrayRegion, jfloatArray, jfloat, "float[]")
+    JNI_ARRAY_REGION_HOOK(GetDoubleArrayRegion, jdoubleArray, jdouble, "double[]")
+
+    JNI_ARRAY_REGION_HOOK(SetBooleanArrayRegion, jbooleanArray, const jboolean, "boolean[]")
+    JNI_ARRAY_REGION_HOOK(SetCharArrayRegion, jcharArray, const jchar, "char[]")
+    JNI_ARRAY_REGION_HOOK(SetShortArrayRegion, jshortArray, const jshort, "short[]")
+    JNI_ARRAY_REGION_HOOK(SetIntArrayRegion, jintArray, const jint, "int[]")
+    JNI_ARRAY_REGION_HOOK(SetLongArrayRegion, jlongArray, const jlong, "long[]")
+    JNI_ARRAY_REGION_HOOK(SetFloatArrayRegion, jfloatArray, const jfloat, "float[]")
+    JNI_ARRAY_REGION_HOOK(SetDoubleArrayRegion, jdoubleArray, const jdouble, "double[]")
+
+#undef JNI_ARRAY_REGION_HOOK
+
+    /**
+     * 批量生成 New<Type>Array 的 hook。
+     * 数组长度本身就有信息量(能看出是不是定长协议帧; 也能对上一一对应的 region 日志)。
+     */
+#define JNI_NEW_ARRAY_HOOK(func, arrType, typeName)                                        \
+    JNITRACE_HOOK_DEF(arrType, func, JNIEnv *env, jsize length) {                          \
+        DL_INFO                                                                            \
+        IS_MATCH                                                                           \
+            arrType ret = orig_##func(env, length);                                        \
+            if (ret != nullptr) {                                                          \
+                GET_ADDRESS                                                                \
+                write(string("<") + address + ">" + #func + " " + typeName +             \
+                      " len=" + to_string(static_cast<int>(length)) + "\n");            \
+            }                                                                              \
+            return ret;                                                                    \
+        }                                                                                  \
+        return orig_##func(env, length);                                                   \
+    }
+
+    JNI_NEW_ARRAY_HOOK(NewBooleanArray, jbooleanArray, "boolean[]")
+    JNI_NEW_ARRAY_HOOK(NewCharArray, jcharArray, "char[]")
+    JNI_NEW_ARRAY_HOOK(NewShortArray, jshortArray, "short[]")
+    JNI_NEW_ARRAY_HOOK(NewIntArray, jintArray, "int[]")
+    JNI_NEW_ARRAY_HOOK(NewLongArray, jlongArray, "long[]")
+    JNI_NEW_ARRAY_HOOK(NewFloatArray, jfloatArray, "float[]")
+    JNI_NEW_ARRAY_HOOK(NewDoubleArray, jdoubleArray, "double[]")
+
+#undef JNI_NEW_ARRAY_HOOK
+
+    //jint        (*RegisterNatives)(JNIEnv*, jclass, const JNINativeMethod*, jint);
+    //
+    // 这条日志直接给出 "Java 类 -> 方法名+签名 -> native 地址" 的对应关系。
+    // 加固 so 通常不让 Java 层调 native, 而是自己在 JNI_OnLoad 里注册进来;
+    // 有了这张表就能反过来定位加固 so 的真实入口(拿到地址再去反汇编),
+    // 不用去逐个猜哪个 anonymouse mapping 是解密后的代码段。
+    JNITRACE_HOOK_DEF(jint, RegisterNatives, JNIEnv *env, jclass clazz,
+                      const JNINativeMethod *methods, jint nMethods) {
+        DL_INFO
+        IS_MATCH
+            jint ret = orig_RegisterNatives(env, clazz, methods, nMethods);
+            if (ret == JNI_OK && methods != nullptr && nMethods > 0) {
+                const string classInfo = getJObjectToString(env, clazz);
+                GET_ADDRESS
+                for (jint i = 0; i < nMethods; ++i) {
+                    write(string("<") + address + ">RegisterNatives [" + classInfo + "] " +
+                          (methods[i].name == nullptr ? "?" : methods[i].name) +
+                          (methods[i].signature == nullptr ? "" : methods[i].signature) +
+                          " -> " + getAddressHex(methods[i].fnPtr) + "\n");
+                }
+            }
+            return ret;
+        }
+        return orig_RegisterNatives(env, clazz, methods, nMethods);
+    }
+
+    //jsize       (*GetStringLength)(JNIEnv*, jstring);
+    JNITRACE_HOOK_DEF(jsize, GetStringLength, JNIEnv *env, jstring str) {
+        DL_INFO
+        IS_MATCH
+            jsize ret = orig_GetStringLength(env, str);
+            GET_ADDRESS
+            write(string("<") + address + ">GetStringLength = " +
+                  to_string(static_cast<int>(ret)) + "\n");
+            return ret;
+        }
+        return orig_GetStringLength(env, str);
+    }
+
+    //const jchar* (*GetStringChars)(JNIEnv*, jstring, jboolean*);
+    //
+    // 与 GetStringUTFChars 不同: 这里是 UTF-16 原文, 不走 MUTF-8 编码,
+    // 所以中文/emoji 不会被改写成代理对字节, 能直接看到字符串真实内容。
+    JNITRACE_HOOK_DEF(const jchar*, GetStringChars, JNIEnv *env, jstring str,
+                      jboolean *isCopy) {
+        DL_INFO
+        IS_MATCH
+            const jchar *ret = orig_GetStringChars(env, str, isCopy);
+            if (ret != nullptr && str != nullptr) {
+                PrintGuard guard;
+                jsize len = env->GetStringLength(str);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                } else if (len > 0) {
+                    GET_ADDRESS
+                    write(string("<") + address + ">GetStringChars len=" +
+                          to_string(static_cast<int>(len)) + "  " +
+                          escapeJCharString(ret, len) + "\n");
+                }
+            }
+            return ret;
+        }
+        return orig_GetStringChars(env, str, isCopy);
+    }
+
+    //const char* (*GetStringUTFChars)(JNIEnv*, jstring, jboolean*);
+    //void        (*ReleaseStringUTFChars)(JNIEnv*, jstring, const char*);
+    JNITRACE_HOOK_DEF(void, ReleaseStringUTFChars, JNIEnv *env, jstring str, const char *chars) {
+        DL_INFO
+        IS_MATCH
+            GET_ADDRESS
+            write(string("<") + address + ">ReleaseStringUTFChars : " +
+                  escapeCString(chars, MAX_PRINT_SIZE) + "\n");
+            orig_ReleaseStringUTFChars(env, str, chars);
+            return;
+        }
+        orig_ReleaseStringUTFChars(env, str, chars);
+    }
+
+    //void        (*ReleaseStringChars)(JNIEnv*, jstring, const jchar*);
+    JNITRACE_HOOK_DEF(void, ReleaseStringChars, JNIEnv *env, jstring str, const jchar *chars) {
+        DL_INFO
+        IS_MATCH
+            if (chars != nullptr && str != nullptr) {
+                PrintGuard guard;
+                jsize len = env->GetStringLength(str);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                } else if (len > 0) {
+                    GET_ADDRESS
+                    write(string("<") + address + ">ReleaseStringChars len=" +
+                          to_string(static_cast<int>(len)) + "  " +
+                          escapeJCharString(chars, len) + "\n");
+                }
+            }
+            orig_ReleaseStringChars(env, str, chars);
+            return;
+        }
+        orig_ReleaseStringChars(env, str, chars);
+    }
+
+    //void*       (*GetPrimitiveArrayCritical)(JNIEnv*, jarray, jboolean*);
+    //
+    // 加固 so 读写大数组时常用 Critical 版(不拷贝, 直接拿堆内指针)。
+    // 元素类型未知, 所以这里只记数组类型与长度 —— 但对应 Set/Get<Type>ArrayRegion 的日志
+    // 往往紧跟在后面, 两边对起来就能定位实际数据。
+    JNITRACE_HOOK_DEF(void*, GetPrimitiveArrayCritical, JNIEnv *env, jarray array,
+                      jboolean *isCopy) {
+        DL_INFO
+        IS_MATCH
+            void *ret = orig_GetPrimitiveArrayCritical(env, array, isCopy);
+            if (ret != nullptr && array != nullptr) {
+                PrintGuard guard;
+                jsize len = env->GetArrayLength(array);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                } else {
+                    const string info = getObjectClassName(env, array);
+                    GET_ADDRESS
+                    write(string("<") + address + ">GetPrimitiveArrayCritical [" + info +
+                          "] len=" + to_string(static_cast<int>(len)) + "\n");
+                }
+            }
+            return ret;
+        }
+        return orig_GetPrimitiveArrayCritical(env, array, isCopy);
+    }
+
+    //void        (*ReleasePrimitiveArrayCritical)(JNIEnv*, jarray, void*, jint);
+    JNITRACE_HOOK_DEF(void, ReleasePrimitiveArrayCritical, JNIEnv *env, jarray array, void *carray,
+                      jint mode) {
+        DL_INFO
+        IS_MATCH
+            GET_ADDRESS
+            write(string("<") + address + ">ReleasePrimitiveArrayCritical mode=" +
+                  to_string(static_cast<int>(mode)) + "\n");
+            orig_ReleasePrimitiveArrayCritical(env, array, carray, mode);
+            return;
+        }
+        orig_ReleasePrimitiveArrayCritical(env, array, carray, mode);
+    }
+
+    //jint        (*Throw)(JNIEnv*, jthrowable);
+    JNITRACE_HOOK_DEF(jint, Throw, JNIEnv *env, jthrowable obj) {
+        DL_INFO
+        IS_MATCH
+            const jint ret = orig_Throw(env, obj);
+            GET_ADDRESS
+            getJObjectInfoInternal(env, obj,
+                                   string("<") + address + ">Throw exception object :", true, "");
+            return ret;
+        }
+        return orig_Throw(env, obj);
+    }
+
+    //jint        (*ThrowNew)(JNIEnv*, jclass, const char*);
+    //
+    // 校验失败/反调试命中时通常靠抛异常改变控制流, 这条日志是这类分支最直接的证据。
+    JNITRACE_HOOK_DEF(jint, ThrowNew, JNIEnv *env, jclass clazz, const char *message) {
+        DL_INFO
+        IS_MATCH
+            const jint ret = orig_ThrowNew(env, clazz, message);
+            GET_ADDRESS
+            write(string("<") + address + ">ThrowNew [" + getJObjectToString(env, clazz) +
+                  "] " + escapeCString(message, MAX_PRINT_SIZE) + "\n");
+            return ret;
+        }
+        return orig_ThrowNew(env, clazz, message);
+    }
+
+    //void        (*ExceptionDescribe)(JNIEnv*);
+    JNITRACE_HOOK_DEF(void, ExceptionDescribe, JNIEnv *env) {
+        DL_INFO
+        IS_MATCH
+            GET_ADDRESS
+            write(string("<") + address + ">ExceptionDescribe\n");
+            orig_ExceptionDescribe(env);
+            return;
+        }
+        orig_ExceptionDescribe(env);
+    }
+
+    //jint        (*MonitorEnter)(JNIEnv*, jobject);
+    JNITRACE_HOOK_DEF(jint, MonitorEnter, JNIEnv *env, jobject obj) {
+        DL_INFO
+        IS_MATCH
+            const jint ret = orig_MonitorEnter(env, obj);
+            GET_ADDRESS
+            getJObjectInfoInternal(env, obj,
+                                   string("<") + address + ">MonitorEnter object :", true, "");
+            return ret;
+        }
+        return orig_MonitorEnter(env, obj);
+    }
+
+    //jint        (*MonitorExit)(JNIEnv*, jobject);
+    JNITRACE_HOOK_DEF(jint, MonitorExit, JNIEnv *env, jobject obj) {
+        DL_INFO
+        IS_MATCH
+            const jint ret = orig_MonitorExit(env, obj);
+            GET_ADDRESS
+            getJObjectInfoInternal(env, obj,
+                                   string("<") + address + ">MonitorExit object :", true, "");
+            return ret;
+        }
+        return orig_MonitorExit(env, obj);
+    }
+
+    //jint        (*GetVersion)(JNIEnv *);
+    JNITRACE_HOOK_DEF(jint, GetVersion, JNIEnv *env) {
+        DL_INFO
+        IS_MATCH
+            const jint ret = orig_GetVersion(env);
+            GET_ADDRESS
+            write(string("<") + address + ">GetVersion = " + to_string(ret) + "\n");
+            return ret;
+        }
+        return orig_GetVersion(env);
+    }
 }
 
 using namespace ZhenxiRunTime::JniTrace;
@@ -2363,6 +2681,12 @@ void Jnitrace::init(JNIEnv *env) {
     HOOK_JNITRACE(env, GetStringRegion)
     HOOK_JNITRACE(env, GetStringUTFRegion)
 
+    //字符串长度与 UTF-16 内容(UTF-16 是原文, 中文/emoji 不会被改写成代理对字节)
+    HOOK_JNITRACE(env, GetStringLength)
+    HOOK_JNITRACE(env, GetStringChars)
+    HOOK_JNITRACE(env, ReleaseStringUTFChars)
+    HOOK_JNITRACE(env, ReleaseStringChars)
+
     //数组与对象基础操作
     //加固 so 根本不碰 NewString(UTF-16 版), 字符串全走 NewStringUTF;
     //但它大量用 NewByteArray/NewObjectArray/GetObjectArrayElement 摆参数,
@@ -2376,6 +2700,48 @@ void Jnitrace::init(JNIEnv *env) {
     HOOK_JNITRACE(env, GetByteArrayElements)
     HOOK_JNITRACE(env, GetObjectClass)
     HOOK_JNITRACE(env, IsInstanceOf)
+
+    //数组创建与 Get/Set<Type>ArrayRegion 全族
+    HOOK_JNITRACE(env, NewBooleanArray)
+    HOOK_JNITRACE(env, NewCharArray)
+    HOOK_JNITRACE(env, NewShortArray)
+    HOOK_JNITRACE(env, NewIntArray)
+    HOOK_JNITRACE(env, NewLongArray)
+    HOOK_JNITRACE(env, NewFloatArray)
+    HOOK_JNITRACE(env, NewDoubleArray)
+
+    HOOK_JNITRACE(env, GetBooleanArrayRegion)
+    HOOK_JNITRACE(env, GetCharArrayRegion)
+    HOOK_JNITRACE(env, GetShortArrayRegion)
+    HOOK_JNITRACE(env, GetIntArrayRegion)
+    HOOK_JNITRACE(env, GetLongArrayRegion)
+    HOOK_JNITRACE(env, GetFloatArrayRegion)
+    HOOK_JNITRACE(env, GetDoubleArrayRegion)
+
+    HOOK_JNITRACE(env, SetBooleanArrayRegion)
+    HOOK_JNITRACE(env, SetCharArrayRegion)
+    HOOK_JNITRACE(env, SetShortArrayRegion)
+    HOOK_JNITRACE(env, SetIntArrayRegion)
+    HOOK_JNITRACE(env, SetLongArrayRegion)
+    HOOK_JNITRACE(env, SetFloatArrayRegion)
+    HOOK_JNITRACE(env, SetDoubleArrayRegion)
+
+    //Critical 版数组访问(不拷贝, 直接拿堆内指针; 加固 so 读写大数组常用)
+    HOOK_JNITRACE(env, GetPrimitiveArrayCritical)
+    HOOK_JNITRACE(env, ReleasePrimitiveArrayCritical)
+
+    // native 方法注册: 直接给出 "Java 类 -> 方法名+签名 -> native 地址" 对应关系, 
+    // 是定位加固 so真实入口最快的途径(低频, 每个类只调一次)
+    HOOK_JNITRACE(env, RegisterNatives)
+
+    //异常与同步
+    HOOK_JNITRACE(env, Throw)
+    HOOK_JNITRACE(env, ThrowNew)
+    HOOK_JNITRACE(env, ExceptionDescribe)
+    HOOK_JNITRACE(env, MonitorEnter)
+    HOOK_JNITRACE(env, MonitorExit)
+
+    HOOK_JNITRACE(env, GetVersion)
 
 
     LOG(INFO) << ">>>>>>>>> Jnitrace hook success! ";
