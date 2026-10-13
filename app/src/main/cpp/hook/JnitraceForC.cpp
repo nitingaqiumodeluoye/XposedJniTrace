@@ -2486,9 +2486,11 @@ getArgsInfoFromArray(JNIEnv *env, jobject obj, jmethodID jmethodId, const jvalue
                 if (env->ExceptionCheck()) {
                     env->ExceptionClear();
                 } else {
-                    const string info = getObjectClassName(env, array);
+                    // 变量名不能叫 info: GET_ADDRESS 宏展开时要用 DL_INFO 里的 info.dli_fbase,
+                    // 同名局部变量会把它遮蔽掉(编译期报 "no member named 'dli_fbase'")
+                    const string arrayInfo = getObjectClassName(env, array);
                     GET_ADDRESS
-                    write(string("<") + address + ">GetPrimitiveArrayCritical [" + info +
+                    write(string("<") + address + ">GetPrimitiveArrayCritical [" + arrayInfo +
                           "] len=" + to_string(static_cast<int>(len)) + "\n");
                 }
             }
