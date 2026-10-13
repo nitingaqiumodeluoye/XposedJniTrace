@@ -980,8 +980,7 @@ namespace ZhenxiRunTime::JniTrace {
             snprintf(buf, sizeof(buf), "%s%p", k == 0 ? "" : " ", p);
             out += buf;
         }
-        out += "]
-";
+        out += "]\n";
         write(out);
     }
 
