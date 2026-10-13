@@ -210,7 +210,7 @@ static JNINativeMethod gMethods[] = {
  *
  * 返回值必须是**非 null** 的库加载回调,否则框架日志只会打
  * "native_init for '...' completed without library-load callback",
- * 这里返回的回调只做通知(记录后续 dlopen 的 so),不安装任何 hook。
+ * 这里返回的回调转发给 linkerHandler(function id "3" 的 so 加载监视),不需要该功能时它自己会忽略。
  */
 extern "C" NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
     if (entries == nullptr) {
@@ -262,8 +262,11 @@ extern "C" NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
     LOGI("native_init: FunJni native api ready (version=%u hookAllSo=%s)",
          VectorApi::Version(), (VectorApi::IsReady() ? "true" : "false"));
 
-    // 4. 必须返回非 null 回调
+    // 4. 必须返回非 null 回调。
+    //    框架每次 dlopen 成功(handle != null)都会调它,这是 function id "3" 的数据来源。
+    //    功能未启用时内部会立即返回(见 linkerHandler::recordLoadedSo)。
     return [](const char *name, void *handle) {
         LOGD("[module-load] name='%s' handle=%p", name == nullptr ? "(null)" : name, handle);
+        linkerHandler::onModuleLoaded(name, handle);
     };
 }
