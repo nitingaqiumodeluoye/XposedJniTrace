@@ -26,7 +26,8 @@ namespace ZhenxiRunTime::JniTrace {
     static constexpr size_t MAX_PRINT_SIZE = 1024;
 
     static void
-    getArgsInfo(JNIEnv *env, jobject obj, jmethodID jmethodId, va_list args, bool isStatic);
+    getArgsInfo(JNIEnv *env, jobject obj, jmethodID jmethodId, va_list args, bool isStatic,
+                const string &callerAddr);
 
     static void getJObjectInfo(JNIEnv *env, jobject obj, const string &methodname);
 
@@ -107,7 +108,7 @@ namespace ZhenxiRunTime::JniTrace {
  * args 必须传 TRACE_ARGS_SNAPSHOT 复制出来的副本,原因见 TRACE_ARGS_SNAPSHOT 的注释。
  */
 #define GET_METHOD_INFO_ARGS(env, obj, methodid, args, isStatic) \
-    getArgsInfo(env,obj,methodid,args,isStatic); \
+    getArgsInfo(env,obj,methodid,args,isStatic,address); \
     va_end(args);
 
 /**
@@ -920,7 +921,7 @@ namespace ZhenxiRunTime::JniTrace {
      * 如果不一致,说明我们对va_list的理解/取值姿势和编译器不一致;
      * 如果一致但仍与真实参数不符,说明拿到的va_list本身就不对。
      */
-    static void dumpVaListForDebug(va_list args, jint paramCount) {
+    static void dumpVaListForDebug(va_list args, jint paramCount, const string &callerAddr) {
         if (!isDebugDump()) {
             return;
         }
@@ -934,7 +935,7 @@ namespace ZhenxiRunTime::JniTrace {
         VaListLayout vl{};
         memcpy(&vl, &args, sizeof(vl));
         char buf[64] = {};
-        string out = "DBG sizeof=" + std::to_string(sizeof(va_list)) +
+        string out = "DBG c=" + callerAddr + " sizeof=" + std::to_string(sizeof(va_list)) +
                      " self=" + getAddressHex(&args) + " stk=" + getAddressHex(vl.stk) +
                      " grTop=" + getAddressHex(vl.grTop) + " vrTop=" + getAddressHex(vl.vrTop) +
                      " grOffs=" + std::to_string(vl.grOffs) +
@@ -986,7 +987,7 @@ namespace ZhenxiRunTime::JniTrace {
      * @param args 必须是va_copy出来的副本,因为orig_xxx会把原始的va_list消费掉
      */
     static void getArgsInfo(JNIEnv *env, jobject obj, jmethodID jmethodId, va_list args,
-                            bool isStatic) {
+                            bool isStatic, const string &callerAddr) {
         if (env == nullptr || obj == nullptr || jmethodId == nullptr) {
             return;
         }
@@ -1052,7 +1053,8 @@ namespace ZhenxiRunTime::JniTrace {
             env->DeleteLocalRef(invokeMethod);
             return;
         }
-        dumpVaListForDebug(args, paramCount);
+        const bool withAddr = isDebugDump();
+        dumpVaListForDebug(args, paramCount, callerAddr);
         auto types = (jobjectArray) env->CallObjectMethod(invokeMethod, typesId);
         env->DeleteLocalRef(methodClazz);
         env->DeleteLocalRef(invokeMethod);
@@ -1076,7 +1078,7 @@ namespace ZhenxiRunTime::JniTrace {
             fetchArgValue(args, typeName, value);
             char indexBuf[48] = {};
             snprintf(indexBuf, sizeof(indexBuf), "args index [%d] ", static_cast<int>(i));
-            printArgValue(env, typeName, value, indexBuf);
+            printArgValue(env, typeName, value, withAddr ? callerAddr + " " + indexBuf : indexBuf);
             if (env->ExceptionCheck()) {
                 env->ExceptionClear();
             }
