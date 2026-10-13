@@ -26,8 +26,7 @@ namespace ZhenxiRunTime::JniTrace {
     static constexpr size_t MAX_PRINT_SIZE = 1024;
 
     static void
-    getArgsInfo(JNIEnv *env, jobject obj, jmethodID jmethodId, va_list args, bool isStatic,
-                const string &callerAddr);
+    getArgsInfo(JNIEnv *env, jobject obj, jmethodID jmethodId, va_list args, bool isStatic);
 
     static void getJObjectInfo(JNIEnv *env, jobject obj, const string &methodname);
 
@@ -108,7 +107,7 @@ namespace ZhenxiRunTime::JniTrace {
  * args 必须传 TRACE_ARGS_SNAPSHOT 复制出来的副本,原因见 TRACE_ARGS_SNAPSHOT 的注释。
  */
 #define GET_METHOD_INFO_ARGS(env, obj, methodid, args, isStatic) \
-    getArgsInfo(env,obj,methodid,args,isStatic,address); \
+    getArgsInfo(env,obj,methodid,args,isStatic); \
     va_end(args);
 
 /**
@@ -905,99 +904,12 @@ namespace ZhenxiRunTime::JniTrace {
     }
 
     /**
-     * 临时诊断开关:存在 /data/local/tmp/funjni_dbg 时,把收到的va_list原样dump出来。
-     */
-    /**
-     * 每次 getArgsInfo 调用一个自增序号:日志是多线程写同一文件,
-     * 只有带上唯一 id 才能把 dump 行与参数行可靠配对。
-     */
-    static std::atomic<uint64_t> gCallSeq{0};
-
-    static bool isDebugDump() {
-        static const bool enabled = [] {
-            FILE *f = fopen("/data/local/tmp/funjni_dbg", "r");
-            if (f == nullptr) {
-                return false;
-            }
-            fclose(f);
-            return true;
-        }();
-        return enabled;
-    }
-
-    /**
-     * 按AArch64的va_list布局(struct __va_list{stack,gr_top,vr_top,gr_offs,vr_offs})
-     * 把结构体字段、完整RSE(x0..x7)、按定位走到的槽位、以及真正用va_arg读到的值
-     * 全部写在**同一行**里。
-     *
-     * 同一行才能自洽地对比:walk(手算grTop+grOffs+8k)和va(va_arg按ABI取)
-     * 如果不一致,说明我们对va_list的理解/取值姿势和编译器不一致;
-     * 如果一致但仍与真实参数不符,说明拿到的va_list本身就不对。
-     */
-    static void dumpVaListForDebug(va_list args, jint paramCount, const string &callerAddr,
-                                   uint64_t callId, jobject invokeObj, jmethodID methodId) {
-        if (!isDebugDump()) {
-            return;
-        }
-        struct VaListLayout {
-            void *stk;
-            void *grTop;
-            void *vrTop;
-            int grOffs;
-            int vrOffs;
-        };
-        VaListLayout vl{};
-        memcpy(&vl, &args, sizeof(vl));
-        char buf[64] = {};
-        string out = "DBG id=" + std::to_string(callId) +
-                     " obj=" + getAddressHex(invokeObj) + " mid=" + getAddressHex(methodId) +
-                     " c=" + callerAddr +
-                     " fp=" + getAddressHex(__builtin_frame_address(0)) +
-                     " self=" + getAddressHex(&args) +
-                     " n=" + std::to_string(static_cast<int>(paramCount)) +
-                     " grOffs=" + std::to_string(vl.grOffs) +
-                     " vrOffs=" + std::to_string(vl.vrOffs) +
-                     " grTop=" + getAddressHex(vl.grTop) +
-                     " stk=" + getAddressHex(vl.stk);
-        // 从 grTop-64 起共 16 个 8 字节槽,覆盖"传参寄存器区"及其后一段
-        out += " win=[";
-        for (int k = 0; k < 16; k++) {
-            void *p = nullptr;
-            if (vl.grTop != nullptr) {
-                memcpy(&p, reinterpret_cast<char *>(vl.grTop) - 64 + k * 8, sizeof(p));
-            }
-            snprintf(buf, sizeof(buf), "%s%p", k == 0 ? "" : " ", p);
-            out += buf;
-        }
-        out += "] va=[";
-        va_list copy;
-        va_copy(copy, args);
-        for (int k = 0; k < paramCount && k < 8; k++) {
-            void *p = va_arg(copy, void *);
-            snprintf(buf, sizeof(buf), "%s%p", k == 0 ? "" : " ", p);
-            out += buf;
-        }
-        va_end(copy);
-        out += "] stk=[";
-        for (int k = 0; k < 4; k++) {
-            void *p = nullptr;
-            if (vl.stk != nullptr) {
-                memcpy(&p, reinterpret_cast<char *>(vl.stk) + k * 8, sizeof(p));
-            }
-            snprintf(buf, sizeof(buf), "%s%p", k == 0 ? "" : " ", p);
-            out += buf;
-        }
-        out += "]\n";
-        write(out);
-    }
-
-    /**
      * 打印被调用的方法信息和全部参数
      *
      * @param args 必须是va_copy出来的副本,因为orig_xxx会把原始的va_list消费掉
      */
     static void getArgsInfo(JNIEnv *env, jobject obj, jmethodID jmethodId, va_list args,
-                            bool isStatic, const string &callerAddr) {
+                            bool isStatic) {
         if (env == nullptr || obj == nullptr || jmethodId == nullptr) {
             return;
         }
@@ -1063,9 +975,6 @@ namespace ZhenxiRunTime::JniTrace {
             env->DeleteLocalRef(invokeMethod);
             return;
         }
-        const bool withAddr = isDebugDump();
-        const uint64_t callId = withAddr ? (gCallSeq.fetch_add(1) + 1) : 0;
-        dumpVaListForDebug(args, paramCount, callerAddr, callId, obj, jmethodId);
         auto types = (jobjectArray) env->CallObjectMethod(invokeMethod, typesId);
         env->DeleteLocalRef(methodClazz);
         env->DeleteLocalRef(invokeMethod);
@@ -1093,11 +1002,7 @@ namespace ZhenxiRunTime::JniTrace {
             fetchArgValue(walk, typeName, value);
             char indexBuf[48] = {};
             snprintf(indexBuf, sizeof(indexBuf), "args index [%d] ", static_cast<int>(i));
-            const string linePrefix = withAddr
-                                       ? "id=" + std::to_string(callId) + " obj="
-                                         + getAddressHex(obj) + " " + callerAddr + " "
-                                       : "";
-            printArgValue(env, typeName, value, linePrefix + indexBuf);
+            printArgValue(env, typeName, value, indexBuf);
             if (env->ExceptionCheck()) {
                 env->ExceptionClear();
             }
