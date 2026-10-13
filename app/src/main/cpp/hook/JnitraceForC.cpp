@@ -900,6 +900,12 @@ namespace ZhenxiRunTime::JniTrace {
     /**
      * 临时诊断开关:存在 /data/local/tmp/funjni_dbg 时,把收到的va_list原样dump出来。
      */
+    /**
+     * 每次 getArgsInfo 调用一个自增序号:日志是多线程写同一文件,
+     * 只有带上唯一 id 才能把 dump 行与参数行可靠配对。
+     */
+    static std::atomic<uint64_t> gCallSeq{0};
+
     static bool isDebugDump() {
         static const bool enabled = [] {
             FILE *f = fopen("/data/local/tmp/funjni_dbg", "r");
@@ -921,7 +927,8 @@ namespace ZhenxiRunTime::JniTrace {
      * 如果不一致,说明我们对va_list的理解/取值姿势和编译器不一致;
      * 如果一致但仍与真实参数不符,说明拿到的va_list本身就不对。
      */
-    static void dumpVaListForDebug(va_list args, jint paramCount, const string &callerAddr) {
+    static void dumpVaListForDebug(va_list args, jint paramCount, const string &callerAddr,
+                                   uint64_t callId, jobject invokeObj, jmethodID methodId) {
         if (!isDebugDump()) {
             return;
         }
@@ -935,26 +942,22 @@ namespace ZhenxiRunTime::JniTrace {
         VaListLayout vl{};
         memcpy(&vl, &args, sizeof(vl));
         char buf[64] = {};
-        string out = "DBG c=" + callerAddr + " sizeof=" + std::to_string(sizeof(va_list)) +
-                     " self=" + getAddressHex(&args) + " stk=" + getAddressHex(vl.stk) +
-                     " grTop=" + getAddressHex(vl.grTop) + " vrTop=" + getAddressHex(vl.vrTop) +
+        string out = "DBG id=" + std::to_string(callId) +
+                     " obj=" + getAddressHex(invokeObj) + " mid=" + getAddressHex(methodId) +
+                     " c=" + callerAddr +
+                     " fp=" + getAddressHex(__builtin_frame_address(0)) +
+                     " self=" + getAddressHex(&args) +
+                     " n=" + std::to_string(static_cast<int>(paramCount)) +
                      " grOffs=" + std::to_string(vl.grOffs) +
                      " vrOffs=" + std::to_string(vl.vrOffs) +
-                     " n=" + std::to_string(static_cast<int>(paramCount));
-        out += " rse(x0..x7)=[";
-        for (int k = 0; k < 8; k++) {
+                     " grTop=" + getAddressHex(vl.grTop) +
+                     " stk=" + getAddressHex(vl.stk);
+        // 从 grTop-64 起共 16 个 8 字节槽,覆盖"传参寄存器区"及其后一段
+        out += " win=[";
+        for (int k = 0; k < 16; k++) {
             void *p = nullptr;
             if (vl.grTop != nullptr) {
                 memcpy(&p, reinterpret_cast<char *>(vl.grTop) - 64 + k * 8, sizeof(p));
-            }
-            snprintf(buf, sizeof(buf), "%s%p", k == 0 ? "" : " ", p);
-            out += buf;
-        }
-        out += "] walk=[";
-        for (int k = 0; k < 8; k++) {
-            void *p = nullptr;
-            if (vl.grTop != nullptr) {
-                memcpy(&p, reinterpret_cast<char *>(vl.grTop) + vl.grOffs + k * 8, sizeof(p));
             }
             snprintf(buf, sizeof(buf), "%s%p", k == 0 ? "" : " ", p);
             out += buf;
@@ -977,7 +980,8 @@ namespace ZhenxiRunTime::JniTrace {
             snprintf(buf, sizeof(buf), "%s%p", k == 0 ? "" : " ", p);
             out += buf;
         }
-        out += "]\n";
+        out += "]
+";
         write(out);
     }
 
@@ -1054,7 +1058,8 @@ namespace ZhenxiRunTime::JniTrace {
             return;
         }
         const bool withAddr = isDebugDump();
-        dumpVaListForDebug(args, paramCount, callerAddr);
+        const uint64_t callId = withAddr ? (gCallSeq.fetch_add(1) + 1) : 0;
+        dumpVaListForDebug(args, paramCount, callerAddr, callId, obj, jmethodId);
         auto types = (jobjectArray) env->CallObjectMethod(invokeMethod, typesId);
         env->DeleteLocalRef(methodClazz);
         env->DeleteLocalRef(invokeMethod);
@@ -1078,7 +1083,11 @@ namespace ZhenxiRunTime::JniTrace {
             fetchArgValue(args, typeName, value);
             char indexBuf[48] = {};
             snprintf(indexBuf, sizeof(indexBuf), "args index [%d] ", static_cast<int>(i));
-            printArgValue(env, typeName, value, withAddr ? callerAddr + " " + indexBuf : indexBuf);
+            const string linePrefix = withAddr
+                                       ? "id=" + std::to_string(callId) + " obj="
+                                         + getAddressHex(obj) + " " + callerAddr + " "
+                                       : "";
+            printArgValue(env, typeName, value, linePrefix + indexBuf);
             if (env->ExceptionCheck()) {
                 env->ExceptionClear();
             }
