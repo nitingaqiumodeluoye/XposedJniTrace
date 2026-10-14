@@ -3,6 +3,7 @@ package com.zhenxi.jnitrace.adapter;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.pm.PackageInfo;
+import android.graphics.Bitmap;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -102,13 +103,35 @@ public class MainListViewAdapter extends BaseAdapter {
         ViewHolder holder = ViewHolder.getHolder(convertView);
         AppBean appBean = data.get(position);
 
-        holder.iv_appIcon.setImageBitmap(Constants.drawable2Bitmap(appBean.appIcon));
+        holder.iv_appIcon.setImageBitmap(loadIconBitmap(appBean));
         holder.tv_appName.setText(appBean.appName);
         holder.tv_packageName.setText(appBean.packageName);
         holder.All.setOnClickListener(v ->
                 initConfig(appBean)
         );
         return convertView;
+    }
+
+    /**
+     * 把 AppBean 里的 Drawable 转成 ImageView 要的 Bitmap。
+     *
+     * 最后这层兜底是为了不再出现"空白格子":
+     * Constants.drawable2Bitmap 现在是通用的,但万一以后再来个连 draw 都画不出东西的
+     * Drawable(或者别处给 appBean.appIcon 塞了 null),setImageBitmap(null) 依旧会把
+     * 该行图标位置清空。这里换成"转不出来用系统默认图标",宁可用默认图也不要空白。
+     */
+    private Bitmap loadIconBitmap(AppBean appBean) {
+        Bitmap bitmap = Constants.drawable2Bitmap(appBean.appIcon);
+        if (bitmap != null) {
+            return bitmap;
+        }
+        CLog.e("icon bitmap is null, use default icon -> " + appBean.packageName);
+        try {
+            return Constants.drawable2Bitmap(mContext.getPackageManager().getDefaultActivityIcon());
+        } catch (Throwable e) {
+            CLog.e("load default icon error -> " + e);
+        }
+        return null;
     }
 
     private static final String[] items = {

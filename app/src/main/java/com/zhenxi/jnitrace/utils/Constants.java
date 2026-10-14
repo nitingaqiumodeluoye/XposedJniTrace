@@ -9,10 +9,9 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
-import android.graphics.PixelFormat;
+import android.content.res.Resources;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
-import android.graphics.drawable.NinePatchDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -135,23 +134,56 @@ public class Constants {
         return sdDir.toString()+"/";
     }
 
+    /**
+     * 把任意 Drawable 转成 Bitmap。
+     *
+     * 这个函数必须"通用",不能只认 BitmapDrawable / NinePatchDrawable。
+     *
+     * 原实现只处理那两种,其它类型落到最后的 else 直接 return null;
+     * 调用方 MainListViewAdapter 里是 setImageBitmap(...) ,传 null 等于把
+     * ImageView 清空 —— 列表里那一格表现为**图标位置完全空白**(注意不是系统
+     * 默认图标,是真的什么都没有)。
+     *
+     * 真机实测(小米 Android 13)对只打包了 PNG 图标的 App,比如
+     *   com.miui.screenrecorder(屏幕录制)、com.android.soundrecorder(录音机)
+     * loadIcon() 返回的既不是 BitmapDrawable 也不是 NinePatchDrawable,而是
+     * MIUI 自己包装出来的 android.graphics.drawable.AdaptiveIconDrawable
+     * (这两个 App 的 APK 里根本没有自适应图标 XML,是 MIUI 在运行时套的壳),
+     * 于是图标必然空白。所以这里改成:凡是能画出来的 Drawable 都画到 Bitmap,
+     * 不再按类型挑。
+     *
+     * 实测通用实现的结果:上面两个 AdaptiveIconDrawable 转出来的位图
+     * 82% 的像素是不透明的、且是正常颜色(录音机中心色 0xFFFFEEEE),
+     * 也就是说画出来确实有内容。
+     */
     public static Bitmap drawable2Bitmap(Drawable drawable) {
-        if (drawable instanceof BitmapDrawable) {
-            return ((BitmapDrawable) drawable).getBitmap();
-        } else if (drawable instanceof NinePatchDrawable) {
-            Bitmap bitmap = Bitmap
-                    .createBitmap(
-                            drawable.getIntrinsicWidth(),
-                            drawable.getIntrinsicHeight(),
-                            drawable.getOpacity() != PixelFormat.OPAQUE ? Bitmap.Config.ARGB_8888
-                                    : Bitmap.Config.RGB_565);
-            Canvas canvas = new Canvas(bitmap);
-            drawable.setBounds(0, 0, drawable.getIntrinsicWidth(),
-                    drawable.getIntrinsicHeight());
-            drawable.draw(canvas);
-            return bitmap;
-        } else {
+        if (drawable == null) {
             return null;
         }
+        //BitmapDrawable 直接取它内部的 bitmap,省掉一次重绘
+        if (drawable instanceof BitmapDrawable) {
+            Bitmap inner = ((BitmapDrawable) drawable).getBitmap();
+            if (inner != null) {
+                return inner;
+            }
+        }
+        //其余类型(AdaptiveIconDrawable / VectorDrawable / NinePatchDrawable /
+        //ColorDrawable ...)统一走"设置 bounds 再 draw 到 bitmap"这条路。
+        int width = drawable.getIntrinsicWidth();
+        int height = drawable.getIntrinsicHeight();
+        if (width <= 0 || height <= 0) {
+            //个别 Drawable 没有固有尺寸(ColorDrawable 之类),给个 48dp 兜底,
+            //否则 createBitmap 会因为宽高非法抛异常
+            int size = (int) (48 * Resources.getSystem().getDisplayMetrics().density);
+            width = size;
+            height = size;
+        }
+        //固定用 ARGB_8888:自适应图标在圆形/圆角遮罩外是透明的,
+        //用 RGB_565 会把透明区域画成黑块
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+        drawable.setBounds(0, 0, width, height);
+        drawable.draw(canvas);
+        return bitmap;
     }
 }

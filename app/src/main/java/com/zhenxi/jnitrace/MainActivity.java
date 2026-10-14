@@ -5,6 +5,7 @@ import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -236,9 +237,9 @@ public class MainActivity extends AppCompatActivity {
             // 非系统应用
             // 系统应用
             appBean.isSystemApp = (packageInfo.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
-            appBean.appName = packageInfo.applicationInfo.loadLabel(getPackageManager()).toString();
+            appBean.appName = loadAppLabel(packageManager, packageInfo);
             appBean.packageName = packageInfo.packageName;
-            appBean.appIcon = packageInfo.applicationInfo.loadIcon(getPackageManager());
+            appBean.appIcon = loadAppIcon(packageManager, packageInfo);
 
             appBeans.add(appBean);
 
@@ -248,6 +249,58 @@ public class MainActivity extends AppCompatActivity {
 
         }
         return appBeans;
+    }
+
+    /**
+     * 取应用名。loadLabel 在个别包上会抛异常(资源损坏、加壳、ASRC 不完整),
+     * 那样会把整个列表的构建循环一起搞挂,所以每个包单独 try 住。
+     */
+    private String loadAppLabel(PackageManager packageManager, PackageInfo packageInfo) {
+        try {
+            CharSequence label = packageInfo.applicationInfo.loadLabel(packageManager);
+            if (label != null && label.length() > 0) {
+                return label.toString();
+            }
+        } catch (Throwable e) {
+            CLog.e("loadLabel error " + packageInfo.packageName + " -> " + e);
+        }
+        //取不到名字就退面包名,至少列表里能看出是哪一行
+        return packageInfo.packageName;
+    }
+
+    /**
+     * 取应用图标,保证**永远不返回 null**。
+     *
+     * 图标空白的问题先在 Utils.Constants.drawable2Bitmap 里修(它原来只认
+     * BitmapDrawable/NinePatchDrawable,遇到 MIUI 包装出来的 AdaptiveIconDrawable
+     * 直接返回 null)。这里再叠二层兜底,把"图标取不到"和"图标转不出来"两种情况
+     * 都兜住 —— 列表里宁可显示系统默认图标,也不要出现一个突兀的空白格子。
+     */
+    private Drawable loadAppIcon(PackageManager packageManager, PackageInfo packageInfo) {
+        try {
+            Drawable icon = packageInfo.applicationInfo.loadIcon(packageManager);
+            if (icon != null) {
+                return icon;
+            }
+        } catch (Throwable e) {
+            CLog.e("loadIcon error " + packageInfo.packageName + " -> " + e);
+        }
+        //兜底1:按包名重新查一次(有些 App 的 applicationInfo 是共享/被改过的)
+        try {
+            Drawable icon = packageManager.getApplicationIcon(packageInfo.packageName);
+            if (icon != null) {
+                return icon;
+            }
+        } catch (Throwable e) {
+            CLog.e("getApplicationIcon error " + packageInfo.packageName + " -> " + e);
+        }
+        //兜底2:系统默认图标
+        try {
+            return packageManager.getDefaultActivityIcon();
+        } catch (Throwable e) {
+            CLog.e("getDefaultActivityIcon error -> " + e);
+        }
+        return null;
     }
 
 

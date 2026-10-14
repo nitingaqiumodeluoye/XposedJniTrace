@@ -212,6 +212,29 @@ nativeLib/src/main/cpp/      native 基础库(被 app 的 CMake add_subdirectory
 22. **`RegisterNatives` 没打**：加固 so 不让 Java 调 native，而是自己在 `JNI_OnLoad`
     里注册。这条日志直接给出 “Java 类 → 方法名+签名 → native 地址”，
     是反向定位加固 so 真实入口最快的途径（比扫匿名 mapping 猜哪段是解密后的代码靠谱）。
+23. **应用列表里图标位置空白（不是没图标，是真空白一格）**：
+    `Constants.drawable2Bitmap()` 只认 `BitmapDrawable` 和 `NinePatchDrawable`，
+    其它类型直接 `return null`；调用处是 `iv_appIcon.setImageBitmap(...)`，
+    传 `null` 等于把 ImageView 清空——所以表现是**那一格什么都没有**
+    （不是系统默认图标，也不是灰底）。
+
+    真机上是谁落到了 `else` 分支：用 `app_process` 探针实测（小米 Android 13，
+    `pm` 取回 `ApplicationInfo` 后调 `loadIcon()`）——
+    `com.miui.screenrecorder`（屏幕录制）和 `com.android.soundrecorder`（录音机）
+    **这两个 App 的 APK 里只有 PNG、根本没有自适应图标 XML**，MIUI 依然在运行时
+    返回自己包装出来的 `android.graphics.drawable.AdaptiveIconDrawable`。
+    第三方代码完全无法预见这种包装，却正好撞上那个 `else return null`。
+
+    验证方式（改之前先确认改了一定有效）：把 Drawable 画进 `ARGB_8888` 位图后
+    统计像素，那两个 `AdaptiveIconDrawable` 的位图 **82% 的像素不透明**、
+    颜色正常（录音机中心色 `0xFFFFEEEE`），即“画出来确实有内容”，不是空壳。
+
+    修法三层：`drawable2Bitmap` 改成通用实现（任何 Drawable 都
+    `setBounds` + `draw` 到 `ARGB_8888` 位图，透明区不漏黑）；
+    `getPackageList()` 里 `loadIcon`/`loadLabel` 各自 try 住并退到
+    `getApplicationIcon` → `getDefaultActivityIcon`；adapter 里转换失败时
+    用系统默认图标顶替，不再出现空白格。
+    注意别用 `RGB_565` 存自适应图标：遮罩外是透明的，会被画成黑块。
 
 ---
 
