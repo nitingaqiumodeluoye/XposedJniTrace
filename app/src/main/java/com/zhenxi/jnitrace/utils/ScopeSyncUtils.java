@@ -6,11 +6,17 @@ import android.os.Looper;
 
 import androidx.annotation.NonNull;
 
+import com.zhenxi.jnitrace.BuildConfig;
+
+import java.io.BufferedReader;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
-import java.util.WeakHashMap;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -28,7 +34,15 @@ import de.wwb.android.wbosed.service.WbServiceHelper;
  * 两套开关互相不知道,所以用户必须两边各勾一次。
  *
  * <h3>用的什么通道</h3>
- * Vector 自带 libxposed service 接口,模块 App 在自己的进程里可以拿到框架服务:
+ *
+ * 两条,按优先级:
+ *
+ * <b>1. root CLI(优先)</b> —— root 跑 {@code /data/adb/lspd/cli scope add <模块包> <目标包>}。
+ * 走 daemon 的 LocalSocket({@code /data/adb/lspd/.cli_sock}),不碰通知与资源,
+ * 零交互、完全自动。daemon 侧 CliHandler 会做全部校验并调 setModuleScope,
+ * 后者触发 ConfigCache 重建,加完立即生效。
+ *
+ * <b>2. requestScope 通知(无 root 时兜底)</b> —— Vector 自带 libxposed service:
  * <pre>
  *   daemon  ModuleAppService.sendBinder(uid)
  *     -> getContentProviderExternal("&lt;applicationId&gt;.WbService", ...)
@@ -38,18 +52,37 @@ import de.wwb.android.wbosed.service.WbServiceHelper;
  * </pre>
  * 拿到句柄后调 {@code requestScope(packages, callback)}:daemon 侧
  * {@code ModuleAppService.requestScope} 会校验 staticScope、检查"永不询问"拉黑,
- * 然后弹一条高优先级通知(NotificationManager.requestModuleScope)让用户点 Approve,
- * 批准后 {@code ModuleDatabase.setModuleScope} 落库并触发 ConfigCache 重建 —— 立即生效。
+ * 然后弹一条高优先级通知(NotificationManager.requestModuleScope)让用户点 Approve。
  *
- * <p>注意 AIDL 里 requestScope 是 oneway,回调也是 oneway,所以必须等到
+ * <h3>为什么 root CLI 优先(而不是直接用通知)</h3>
+ *
+ * 2026-10-15 实测(rubens / MTK 天玛 8100):daemon 构建 scope 请求通知时会在
+ * {@code NotificationManager.getBitmap()} 撞上联发科私有类的空指针,
+ * 整个 binder 事务被打断,通知从未发出:
+ *
+ * <pre>
+ *   13:40:19.571  FunJni 保存配置 + requestScope(com.zhenxi.hunter)
+ *   13:40:19.582  W Binder: Caught a RuntimeException from the binder stub implementation.
+ *                   android.content.res.Resources$NotFoundException:
+ *                     Drawable org.matrix.vector.daemon:drawable/ic_statue_monochrome
+ *                   Caused by: java.lang.NullPointerException
+ *                     at com.mediatek.res.AsyncDrawableCache.putCacheList(...:165)   &lt;- MTK 私有
+ *                     at android.content.res.ResourcesImpl.cacheDrawable(...:800)
+ *                     at ad.onTransact(...)                                        &lt;- daemon binder stub
+ *   13:41:19.578  FunJni: ScopeSync sync result: success=false msg=等待 Vector 授权超时  (60s 后)
+ * </pre>
+ *
+ * 根因在 {@code FileSystem.resources}(反射手工构造的 {@code Resources(am, null, null)},
+ * 无真实 DisplayMetrics/Configuration)在 MIUI 的 {@code MiuiResourcesImpl} 上触发了 MTK
+ * 的 drawable 缓存分支。它与模块代码无关,但会吃掉整条通知通道。
+ *
+ * <p>所以有 root 时优先走 CLI —— 既零交互,也顺带避开通知通道的所有坑。
+ * 无 root 时才退回通知(那条路上第一次必须用户点一次"允许",
+ * 因为 Vector 把 scope 变更定义为需知情同意的操作)。
+ *
+ * <p>AIDL 里 requestScope 是 oneway,回调也是 oneway,所以通知通道必须等到
  * onScopeRequestApproved/onScopeRequestFailed 才算完成;本类用 CountDownLatch 把它
  * 转成同步结果,方便在保存配置的流程里顺序调用。
- *
- * <h3>为什么不能只是"后台静默"</h3>
- * Vector 把"模块要进哪些 App 的 scope"当作需要用户知情同意的操作,所以第一次必然有
- * 一条通知。用户在那条通知上点 Approve 时如果选"不再询问"(daemon 侧落到
- * PreferenceStore 的 scope_request_blocked 反向集合之外),后续调用才会直接通过。
- * 换句话说:第一次一次点击,之后就是"选中即生效"。
  */
 public final class ScopeSyncUtils {
 
@@ -57,14 +90,27 @@ public final class ScopeSyncUtils {
     private static final long REQUEST_TIMEOUT_SECONDS = 60L;
     /** 服务尚未投递时最多等多久(冷启动场景:FunJni 刚被拉起,daemon 还没送 binder)。 */
     private static final long SERVICE_WAIT_SECONDS = 5L;
+    /** root CLI 通道的超时;daemon 自己会快得多,这里的超时是为了防 su 卡死。 */
+    private static final long CLI_TIMEOUT_SECONDS = 15L;
+
+    /** daemon 启动时由 FileSystem.setupCli() 拷到这里。 */
+    private static final String CLI_PATH = "/data/adb/lspd/cli";
+    /** 模块自己的包名,作为 scope add 的第一个参数。 */
+    private static final String MODULE_PACKAGE = BuildConfig.APPLICATION_ID;
 
     /** 框架服务句柄;回调可能来自 binder 线程,所以用 volatile + 主线程可见性保证。 */
     private static volatile WbService sService;
     private static volatile boolean sListenerRegistered;
 
-    /** 已完成"不再询问"授权的包,避免每次都等通知。进程内缓存,重启后重新走一次通知。 */
-    private static final Map<String, Boolean> sAutoApproved =
-            Collections.synchronizedMap(new WeakHashMap<String, Boolean>());
+    /**
+     * 本进程内已经同步过的包,避免重复跑 CLI / 重复弹通知。
+     *
+     * <p>用普通 Set 而非 WeakHashMap:键是运行期新建的 String,WeakHashMap 会把它当
+     * 弱引用在下次 GC 时清掉,于是同一个包会被反复同步。包名数量很少,不值当为它做
+     * 弱引用。重启后重新同步一次是廉价且正确的行为。
+     */
+    private static final Set<String> sAutoApproved =
+            Collections.synchronizedSet(new HashSet<String>());
 
     private ScopeSyncUtils() {
     }
@@ -114,6 +160,18 @@ public final class ScopeSyncUtils {
         return sService != null;
     }
 
+    /**
+     * 自动同步链路是否可用:root CLI 或 Vector 服务任一就绪即可。
+     *
+     * <p>供 UI 提示用。root CLI 优先,所以即使 WbService 没投递到(例如 daemon 在
+     * MIUI/MTK 上构建通知图标崩溃),只要设备有 root,同步依旧可用。
+     *
+     * <p>会计一次 root 探测,所以不要在布局渲染的热路径里反复调。
+     */
+    public static boolean isSyncAvailable() {
+        return sService != null || RootUtils.checkGetRootAuth();
+    }
+
     /** 同步结果,供 UI 区分"已批准/被拒/超时/框架不可用"。 */
     public static final class Result {
         public final boolean success;
@@ -142,11 +200,12 @@ public final class ScopeSyncUtils {
     /**
      * 把 {@code targetPackages} 追加进 FunJni 在 Vector 里的 scope。
      *
-     * <p>阻塞等待用户批准(最长 {@link #REQUEST_TIMEOUT_SECONDS} 秒),<b>必须在线程调用</b>,
-     * 不要放在主线程 —— 用户可能十几秒后才点通知。
+     * <p>先试 root CLI(立刻返回),不可用时才回退到 requestScope 通知。
+     * 通知通道会阻塞等待用户批准(最长 {@link #REQUEST_TIMEOUT_SECONDS} 秒),
+     * <b>所以必须在线程调用</b>,不要放在主线程。
      *
      * @param context        任意 context,仅用于 toast 与日志
-     * @param targetPackages 目标包名,已批准的会从后续请求里剔除
+     * @param targetPackages 目标包名,已同步过的会从后续请求里剔除
      * @return 同步结果;成功时表示这些包已进 scope 并已触发注入
      */
     public static Result syncScope(Context context, List<String> targetPackages) {
@@ -160,7 +219,7 @@ public final class ScopeSyncUtils {
             if (pkg == null || pkg.isEmpty()) {
                 continue;
             }
-            if (Boolean.TRUE.equals(sAutoApproved.get(pkg))) {
+            if (sAutoApproved.contains(pkg)) {
                 continue;
             }
             if (!pending.contains(pkg)) {
@@ -171,10 +230,38 @@ public final class ScopeSyncUtils {
             return Result.ok("目标已在 Vector scope 中");
         }
 
+        // ── 通道 1:root CLI(优先)────────────────────────────────────────
+        //
+        // 实测(2026-10-15,rubens/MTK):daemon 构建 scope 请求通知时会在
+        // NotificationManager.getBitmap() 撞上联发科的 AsyncDrawableCache NPE
+        // (com.mediatek.res.AsyncDrawableCache.putCacheList),整个 binder 事务被
+        // 打断 —— 通知从未发出,模块侧只能等到 60s 超时。日志形态:
+        //
+        //   W Binder: Caught a RuntimeException from the binder stub implementation.
+        //     Resources$NotFoundException: Drawable ...:drawable/ic_statue_monochrome
+        //     Caused by: NPE at com.mediatek.res.AsyncDrawableCache.putCacheList
+        //       at ad.onTransact(daemon 的 IWbService stub)
+        //
+        // 而 vector-cli 走的是 daemon 的 LocalSocket,完全不碰通知/资源,不受此 bug 影响:
+        //
+        //   su -c "/data/adb/lspd/cli scope add <模块包> <目标包>"   ->  退出码 0
+        //
+        // 所以有 root 时优先走 CLI:零交互、完全自动,也顺带避开了通知通道的所有坑。
+        final Result cliResult = syncViaRootCli(pending);
+        if (cliResult != null) {
+            if (cliResult.success) {
+                for (String pkg : pending) {
+                    sAutoApproved.add(pkg);
+                }
+            }
+            return cliResult;
+        }
+
+        // ── 通道 2:requestScope 通知(无 root / CLI 不可用时兜底)──────
         final WbService service = awaitService();
         if (service == null) {
             return Result.noService(
-                    "未连上 Vector 服务,请确认模块已启用并重启 FunJni 后重试");
+                    "未连上 Vector 服务,也没有 root 可用:请启用模块并重启 FunJni,或去管理面板手动勾选");
         }
 
         // 已经是 scope 成员的就跳过,减少通知里的噪音(也是幂等保护)。
@@ -199,7 +286,7 @@ public final class ScopeSyncUtils {
                 @Override
                 public void onScopeRequestApproved(@NonNull List<String> approved) {
                     for (String pkg : approved) {
-                        sAutoApproved.put(pkg, Boolean.TRUE);
+                        sAutoApproved.add(pkg);
                     }
                     outcome.set(Result.ok("已批准并同步进 Vector scope: " + approved));
                     latch.countDown();
@@ -230,6 +317,101 @@ public final class ScopeSyncUtils {
             return Result.fail("等待 Vector 授权超时,请在通知栏点\"允许\"后重试");
         }
         return result;
+    }
+
+    /**
+     * 通过 root 跑 vector-cli 把目标加进 scope。
+     *
+     * <p>走 daemon 的 LocalSocket(`/data/adb/lspd/.cli_sock`),不碰通知与资源,
+     * 所以不受 MIUI/MTK 那个图标 NPE 影响。实测可用:
+     *
+     * <pre>
+     *   # /data/adb/lspd/cli scope add com.zhenxi.jnitrace com.zhenxi.hunter
+     *   Successfully appended 1 apps to com.zhenxi.jnitrace scope.   (退出码 0)
+     * </pre>
+     *
+     * <p>daemon 侧 CliHandler.handleScope 的 "add" 分支会自己做全部校验
+     * (rejectBeyondStaticScope / 已有去重)并调 ModuleDatabase.setModuleScope,
+     * 后者触发 ConfigCache.requestCacheUpdate() —— 所以加完立即生效。
+     *
+     * @return 成功/失败的 Result;null 表示「这条路不可用」(无 root 或 cli 不存在),
+     *         调用方应回退到 requestScope 通知通道。
+     */
+    private static Result syncViaRootCli(List<String> pending) {
+        // RootUtils.execShell 不返回退出码,这里需要自己跑并读 exit code,
+        // 否则会把「su 被拒」当成「同步成功」。
+        //
+        // redirectErrorStream(true):CLI 的错误走 System.err(OutputFormatter 里
+        // System.err.println("Error: ..."))。若不合并而只读 stdout,stderr 缓冲区写满时
+        // 子进程会阻塞,stdout 永远等不到 EOF —— 经典管道死锁。
+        Process process = null;
+        BufferedReader reader = null;
+        try {
+            if (!RootUtils.checkGetRootAuth()) {
+                CLog.i(TAG + " no root; falling back to requestScope");
+                return null;
+            }
+
+            // CLI 路径:daemon 启动时 FileSystem.setupCli() 会把脚本拷到这里
+            final StringBuilder cmd = new StringBuilder();
+            cmd.append(CLI_PATH).append(" scope add ").append(MODULE_PACKAGE);
+            for (String pkg : pending) {
+                cmd.append(' ').append(pkg);
+            }
+
+            process = new ProcessBuilder("su").redirectErrorStream(true).start();
+            final DataOutputStream os = new DataOutputStream(process.getOutputStream());
+            os.writeBytes(cmd + "\n");
+            // 让 su 执行完就退出,否则 waitFor 会一直等输入。
+            // sh 的裸 exit 不带参数时,退出码 = 最后一条命令的退出码,
+            // 所以 CLI 的 0/1 能传到我们这里。
+            os.writeBytes("exit\n");
+            os.flush();
+            os.close();
+
+            reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            final StringBuilder stdout = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                stdout.append(line).append('\n');
+            }
+
+            if (!process.waitFor(CLI_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                CLog.e(TAG + " vector-cli timed out: " + cmd);
+                return null;
+            }
+
+            final int exit = process.exitValue();
+            final String out = stdout.toString().trim();
+            CLog.i(TAG + " vector-cli exit=" + exit + " out=" + out);
+
+            if (exit == 0 && out.contains("Successfully")) {
+                return Result.ok("已同步进 Vector scope(root CLI): " + pending);
+            }
+
+            // 退出码非 0。只有 staticScope 拒绝是确定性的 —— 那条 requestScope 也会拒,
+            // 再弹一次通知没意义。其余(daemon 没跑 / socket 不存在 / cli 脚本缺失)
+            // 都应该回退到通知通道,那里是另一条完全不同的路。
+            if (out.contains("fixes its scope")) {
+                return Result.fail("Vector 拒绝了 scope 请求(模块声明了 staticScope): " + out);
+            }
+            CLog.w(TAG + " vector-cli unusable (exit=" + exit + " out=" + out + "), falling back");
+            return null;
+        } catch (Throwable e) {
+            // 没 root / cli 缺失 / su 报错 —— 都不是致命错误,交给通知通道。
+            CLog.i(TAG + " vector-cli path unavailable: " + e);
+            return null;
+        } finally {
+            try {
+                if (reader != null) {
+                    reader.close();
+                }
+            } catch (IOException ignored) {
+            }
+            if (process != null) {
+                process.destroy();
+            }
+        }
     }
 
     /**

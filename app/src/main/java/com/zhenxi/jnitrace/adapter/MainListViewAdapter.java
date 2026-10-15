@@ -251,11 +251,11 @@ public class MainListViewAdapter extends BaseAdapter {
         // (daemon 的 ModuleDatabase.setModuleScope 才是真相)。以前这两件事得在
         // 两个地方各做一次 —— 现在在这里统一发起。
         //
-        // 走的是 Vector 的 libxposed service:requestScope 会弹一条高优先级通知,
-        // 用户点"允许"后落库并触发 ConfigCache 重建,立即生效。第一次要一次点击,
-        // 之后本进程内已批准过的包不再重复请求。
+        // 优先走 root CLI(`/data/adb/lspd/cli scope add`):零交互、立即生效,
+        // 而且避开了 requestScope 通知通道在 MIUI/MTK 上会崩的图标加载问题
+        // (详见 ScopeSyncUtils 的头注释)。无 root 时才回退到通知。
         //
-        // 异步执行:用户可能十几秒后才点通知,不能堵住 UI 线程。
+        // 异步执行:通知通道需要用户点"允许",可能十几秒后才完成,不能堵住 UI 线程。
         ScopeSyncUtils.syncScopeAsync(mContext,
                 java.util.Collections.singletonList(bean.packageName));
     }

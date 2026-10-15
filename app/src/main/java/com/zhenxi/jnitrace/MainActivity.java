@@ -94,9 +94,9 @@ public class MainActivity extends AppCompatActivity {
             if (isFinishing() || isDestroyed()) {
                 return;
             }
-            String msg = ScopeSyncUtils.isServiceAvailable()
+            String msg = ScopeSyncUtils.isSyncAvailable()
                     ? "已连接 Vector,选中应用将自动同步到 scope"
-                    : "未连上 Vector 服务:选中应用后仍需在管理面板手动勾选";
+                    : "未连上 Vector,也无 root:选中应用后需在管理面板手动勾选";
             ToastUtils.showToast(MainActivity.this, msg);
         }, 1500L);
     }
