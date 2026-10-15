@@ -91,6 +91,24 @@ jobs:
           if "${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS}/aapt2" dump badging "$APK" | grep -q "application-debuggable"; then
             echo "!! release APK 仍然是 debuggable"; exit 1
           fi
+          # 模块侧服务端点必须真的在包里:daemon 靠 authority "<applicationId>.WbService"
+          # 调 getContentProviderExternal 找进程并投递框架 binder,少了它 requestScope /
+          # RemotePreferences 全部不可用,daemon 还会重试 3 次后节流 60s。
+          "${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS}/aapt2" dump xmltree --file AndroidManifest.xml "$APK" \
+            | grep -q 'A: http://schemas.android.com/apk/res/android:authorities.*com.zhenxi.jnitrace.WbService' \
+            || { echo "!! 缺少 .WbService provider (Vector 服务投递点)"; exit 1; }
+          "${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS}/aapt2" dump xmltree --file AndroidManifest.xml "$APK" \
+            | grep -q 'de.wwb.android.wbosed.service.WbProvider' \
+            || { echo "!! provider 类名不对"; exit 1; }
+          # provider 的类必须在 dex 里:compileOnly 会编过但运行期 ClassNotFoundException
+          unzip -p "$APK" classes.dex > /tmp/classes.dex
+          "${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS}/dexdump" /tmp/classes.dex \
+            | grep -q 'Class descriptor.*de/wwb/android/wbosed/service/WbProvider' \
+            || { echo "!! WbProvider 没打进 dex (vector-service.jar 是不是写成了 compileOnly?)"; exit 1; }
+          # 服务层入口类也要在
+          "${ANDROID_SDK_ROOT}/build-tools/${BUILD_TOOLS}/dexdump" /tmp/classes.dex \
+            | grep -q 'Class descriptor.*de/wwb/android/wbosed/service/WbServiceHelper' \
+            || { echo "!! WbServiceHelper 没打进 dex"; exit 1; }
           echo "layout ok"
 
       # 反盗版会 System.exit(9),签名对不上模块 App 直接闪退,这里提前把关

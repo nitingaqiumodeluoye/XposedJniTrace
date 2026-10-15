@@ -24,6 +24,7 @@ import com.zhenxi.jnitrace.utils.Constants;
 import com.zhenxi.jnitrace.utils.FileUtils;
 import com.zhenxi.jnitrace.utils.GsonUtils;
 import com.zhenxi.jnitrace.utils.RootUtils;
+import com.zhenxi.jnitrace.utils.ScopeSyncUtils;
 import com.zhenxi.jnitrace.utils.SpUtil;
 import com.zhenxi.jnitrace.utils.ToastUtils;
 
@@ -242,6 +243,21 @@ public class MainListViewAdapter extends BaseAdapter {
         ToastUtils.showToast(mContext,
                 "保存成功文件路径为\n" +
                         "data/data/" + bean.packageName);
+
+        // 顺手把这个目标同步进 Vector 的 scope,用户不用再去管理面板重复勾一次。
+        //
+        // FunJni 自己的配置上面已经写完了(SP + root cp 出的 FunJniConfig);
+        // 但模块能不能注入进目标进程,取决于 Vector 数据库里 scope 表有没有这一行
+        // (daemon 的 ModuleDatabase.setModuleScope 才是真相)。以前这两件事得在
+        // 两个地方各做一次 —— 现在在这里统一发起。
+        //
+        // 走的是 Vector 的 libxposed service:requestScope 会弹一条高优先级通知,
+        // 用户点"允许"后落库并触发 ConfigCache 重建,立即生效。第一次要一次点击,
+        // 之后本进程内已批准过的包不再重复请求。
+        //
+        // 异步执行:用户可能十几秒后才点通知,不能堵住 UI 线程。
+        ScopeSyncUtils.syncScopeAsync(mContext,
+                java.util.Collections.singletonList(bean.packageName));
     }
 
     /**

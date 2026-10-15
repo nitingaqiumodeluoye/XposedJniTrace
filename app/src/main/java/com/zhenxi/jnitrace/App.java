@@ -7,6 +7,7 @@ import android.content.pm.PackageManager;
 
 import com.zhenxi.jnitrace.utils.CLog;
 import com.zhenxi.jnitrace.utils.RootUtils;
+import com.zhenxi.jnitrace.utils.ScopeSyncUtils;
 import com.zhenxi.jnitrace.utils.ThreadUtils;
 import com.zhenxi.jnitrace.utils.ToastUtils;
 
@@ -48,6 +49,11 @@ public class App extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
+
+        // 注册 Vector 服务监听,拿到框架的 IWbService 句柄。
+        // 必须早于任何 requestScope:WbServiceHelper 在 registerListener 之前收到的
+        // binder 只会被缓存,注册后会一并回调,所以在这里注册最稳。
+        ScopeSyncUtils.init(this);
 
         getRoot();
 

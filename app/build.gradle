@@ -14,8 +14,8 @@ android {
         // Vector 要求 minSdk >= 27;soLoader 目前只支持 arm64-v8a
         minSdk 27
         targetSdk 28
-        versionCode 2
-        versionName "1.1"
+        versionCode 3
+        versionName "1.2"
 
         ndk {
             abiFilters 'arm64-v8a'
@@ -33,6 +33,9 @@ android {
         // CLog/LHook 里用到了 BuildConfig.project_name / is_printf_log
         buildConfig true
     }
+
+    // 不用 aidl = true:服务层(含 IWbService/IWbScopeCallback 等 AIDL 生成的接口)已经
+    // 编成 app/libs/vector-service.jar 导入,与 vector-api-compile-only.jar 同一套做法。
 
     externalNativeBuild {
         cmake {
@@ -112,4 +115,15 @@ dependencies {
     // 只用于编译,不打包。jar 从 Vector 的 xposed + legacy 两个模块的 compile 产物导出,
     // Vector API 变更时需要重新导出(见 README)。
     compileOnly files('libs/vector-api-compile-only.jar')
+
+    // Vector 的模块侧服务层:WbService / WbServiceHelper / WbProvider / RemotePreferences
+    // 以及 IWbService 等 AIDL 生成的接口。与上面那个 jar 不同,这份必须用 implementation —
+    // WbProvider 真的要在本 APK 里运行:daemon 的 ModuleAppService.sendBinder() 是靠
+    // authority "<applicationId>.WbService" 调 getContentProviderExternal 找到进程,
+    // 再 provider.call("SendBinder", ...) 把框架的 IWbService binder 投递进来的。
+    // compileOnly 的话 provider 不在包里,daemon 会连续重试 3 次后节流 60s。
+    //
+    // 来源:E:/52/Vector/services/libxposed-service 的 release classes.jar
+    // (namespace de.wwb.android.wbosed.service.lib,与 Vector 同一套源码)。
+    implementation files('libs/vector-service.jar')
 }

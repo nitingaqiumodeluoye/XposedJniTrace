@@ -9,6 +9,8 @@ import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 
 import android.view.View;
 import android.widget.CheckBox;
@@ -26,6 +28,7 @@ import com.zhenxi.jnitrace.bean.AppBean;
 import com.zhenxi.jnitrace.adapter.MainListViewAdapter;
 import com.zhenxi.jnitrace.utils.CLog;
 import com.zhenxi.jnitrace.utils.PermissionUtils;
+import com.zhenxi.jnitrace.utils.ScopeSyncUtils;
 import com.zhenxi.jnitrace.utils.ToastUtils;
 import com.zhenxi.jnitrace.view.Xiaomiquan;
 import com.xiaoyouProject.searchbox.SearchFragment;
@@ -73,6 +76,29 @@ public class MainActivity extends AppCompatActivity {
         initData();
         initView();
         PermissionUtils.initPermission(this, permissionList);
+
+        // Vector 服务是 daemon 主动投递过来的,FunJni 刚启动时可能还没到;
+        // 稍后回来看一眼,在界面上告诉用户同步链路是否可用。
+        reportVectorStatus();
+    }
+
+    /**
+     * 提示 Vector 服务连接状态。
+     *
+     * <p>同步链路不可用时并不影响 FunJni 原有功能(配置照旧写 SP + root cp),
+     * 只是选中的应用不会自动进 Vector scope,用户仍可去管理面板手动勾选;所以这里
+     * 只提示、不阻断。
+     */
+    private void reportVectorStatus() {
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
+            String msg = ScopeSyncUtils.isServiceAvailable()
+                    ? "已连接 Vector,选中应用将自动同步到 scope"
+                    : "未连上 Vector 服务:选中应用后仍需在管理面板手动勾选";
+            ToastUtils.showToast(MainActivity.this, msg);
+        }, 1500L);
     }
 
     @Override

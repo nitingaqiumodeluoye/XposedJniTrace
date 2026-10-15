@@ -63,6 +63,23 @@
             </intent-filter>
         </activity>
         <activity android:name=".view.Xiaomiquan" />
+
+        <!--
+            Vector 的模块侧服务端点。daemon 的 ModuleAppService.sendBinder() 用
+            authority "<applicationId>.WbService" 调 getContentProviderExternal() 找到
+            本进程,再 provider.call("SendBinder", {binder}) 把框架的 IWbService
+            binder 投进来。少了这个 provider,daemon 找不到投递点,会重试 3 次然后
+            节流 60s(FunJni 之前一直是这个状态),模块 App 就拿不到 WbService ——
+            既无法 requestScope,也无法用 RemotePreferences。
+
+            类本体来自 libs/vector-service.jar(implementation,会打进 dex);
+            exported=true 是必需的 —— daemon 以 uid 1000 的 "android" 包名调它。
+        -->
+        <provider
+            android:name="de.wwb.android.wbosed.service.WbProvider"
+            android:authorities="${applicationId}.WbService"
+            android:exported="true"
+            tools:ignore="ExportedContentProvider" />
     </application>
 
 </manifest>
