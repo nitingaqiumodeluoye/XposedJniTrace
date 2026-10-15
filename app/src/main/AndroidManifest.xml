@@ -28,27 +28,28 @@
         tools:ignore="GoogleAppIndexingWarning,HardcodedDebugMode">
 
 
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-        <meta-data
-            android:name="xposeddescription"
-            android:value="珍惜--FunJni" />
         <!--
-            xposedminversion > 92(或下面显式声明 xposedsharedprefs)会让框架:
-              1) 把模块自己进程的 ContextImpl.getPreferencesDir() 重定向到
-                 /data/adb/vector(或 lspd)/prefs/<模块包名>/,这样模块 App 写的
-                 getSharedPreferences("config") 会落到"目标进程也能读"的目录;
-              2) 让目标进程里的 XSharedPreferences 从该目录读配置,而不是去读
-                 /data/data/<模块>/shared_prefs/(目标进程没有权限读)。
-            没有这两条,配置就得靠 root 往目标 data 目录里 mv 一份老办法。
+            这里故意不再声明任何 xposed* meta-data。
+
+            模块身份完全由 META-INF/xposed/ 下的 marker 文件承载(module.prop /
+            java_init.list / native_init.list),Vector daemon 的 MODERN 策略读的就是这些
+            (FileSystem.loadModule:targetApiVersion>=101 -> MODERN),与 manifest 无关。
+
+            而这些 meta-data 反而是纯暴露面:安全扫描器只要 getInstalledApplications(
+            GET_META_DATA) 扫一遍 manifest 的键名就能命中(xposedmodule / xposedminversion /
+            xposedsharedprefs / xposedscope / xposeddescription),不需要任何运行时证据,
+            属于 "包级残留" 级别的弱信号 —— DuckDetector 的 LSPosed 卡片就是这么报的。
+
+            删掉后的行为变化:
+              1) Vector 的 LegacyDelegateImpl.hookNewXSP() 依赖 xposedminversion>92 或
+                 xposedsharedprefs 才会给目标进程装 ContextImpl.getPreferencesDir()
+                 重定向钩子,所以那条共享 prefs 路径会失效;
+              2) XSharedPreferences 会退回读 /data/data/<模块包名>/shared_prefs/config.xml,
+                 目标进程没有该 uid 的读权限。
+            兜底是 root cp(MainListViewAdapter.initConfig):配置一直被复制到目标 App 私有
+            目录下的 FunJniConfig,而 LHook 的二次尝试读的就是它。有 root 时功能不变;
+            无 root 时共享 prefs 路径失效,模块在目标进程里读不到配置。
         -->
-        <meta-data
-            android:name="xposedminversion"
-            android:value="93" />
-        <meta-data
-            android:name="xposedsharedprefs"
-            android:value="true" />
 
 
 
