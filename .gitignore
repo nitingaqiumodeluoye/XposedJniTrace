@@ -18,3 +18,4 @@ local.properties
 /dist
 /dist_ci
 verify*.png
+ui_check/
