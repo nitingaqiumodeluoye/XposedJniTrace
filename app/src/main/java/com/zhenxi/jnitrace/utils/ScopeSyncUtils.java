@@ -395,7 +395,7 @@ public final class ScopeSyncUtils {
             if (out.contains("fixes its scope")) {
                 return Result.fail("Vector 拒绝了 scope 请求(模块声明了 staticScope): " + out);
             }
-            CLog.w(TAG + " vector-cli unusable (exit=" + exit + " out=" + out + "), falling back");
+            CLog.i(TAG + " vector-cli unusable (exit=" + exit + " out=" + out + "), falling back");
             return null;
         } catch (Throwable e) {
             // 没 root / cli 缺失 / su 报错 —— 都不是致命错误,交给通知通道。
